@@ -1,0 +1,30 @@
+[project]
+name = "compute-server-base"
+version = "0.1.0"
+description = "Shared FastAPI compute-server template for spark-lab-stack tool instances"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+# 3.10, not the repo's usual 3.12: the thermocalc image is pinned to
+# python:3.10-slim-bookworm for TC-Python 2025.2 and this package has to
+# import there. Keep 3.10-compatible syntax (no StrEnum, no match).
+requires-python = ">=3.10"
+authors = [
+    { name = "Tripp Robinson", email = "trippr5118@tamu.edu" },
+]
+dependencies = [
+    "fastapi>=0.115",
+    "pydantic>=2.9",
+]
+
+# hatchling, not the repo's usual uv_build: uv_build is a Rust binary, and the
+# thermocalc image builds under qemu-user emulation, where it dies with the
+# "QEMU internal SIGSEGV" this repo has already hit elsewhere. A pure-Python
+# backend has no such problem. Measured 2026-08-12.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Flat layout, not the repo's usual src/: the Dockerfiles COPY this directory
+# in whole and `pip install` it, and a src/ level buys nothing there.
+[tool.hatch.build.targets.wheel]
+packages = ["compute_server_base"]
