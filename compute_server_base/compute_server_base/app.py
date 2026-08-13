@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
-from compute_server_base.auth import check_ws_token, require_token
+from compute_server_base.auth import check_ws_token, require_token, set_audience
 
 # Runtime import, not TYPE_CHECKING: FastAPI resolves the /capabilities return
 # annotation into a response model when the route is registered, and a forward
@@ -65,6 +65,11 @@ def create_app(
     Returns:
         The app, with `app.state.jobs` holding the JobManager.
     """
+    # Before any route exists: a dashboard-issued token carries `aud: tool:<name>`,
+    # so this server has to know its own name to reject one minted for a sibling
+    # instance (S-4).
+    set_audience(tool_name)
+
     manager = JobManager()
     # Assigned below, after the app exists; the lifespan closure reads it at
     # startup, by which point mcp_mount has run.

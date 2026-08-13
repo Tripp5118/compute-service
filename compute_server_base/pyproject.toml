@@ -18,6 +18,9 @@ dependencies = [
     # server class FastMCP -> MCPServer and the client entry point to
     # streamable_http_client; 1.x will not import this package's code.
     "mcp>=2.0,<3",
+    # Verifying dashboard-issued job tokens (S-4). Same library the dashboard
+    # signs them with, so the two sides cannot disagree about HS256 or claims.
+    "pyjwt>=2.9",
 ]
 
 # hatchling, not the repo's usual uv_build: uv_build is a Rust binary, and the
