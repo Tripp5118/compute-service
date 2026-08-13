@@ -89,9 +89,18 @@ def under_emulation() -> bool:
 def probe_import(module_path: str) -> tuple[bool, str | None]:
     """Whether a module actually imports here, so capability is measured rather than claimed."""
     try:
-        importlib.import_module(module_path)
+        module = importlib.import_module(module_path)
     except Exception as exc:  # noqa: BLE001 — reporting import health, not handling one specific error
         return False, f"{type(exc).__name__}: {exc}"
+    # An empty directory on sys.path imports cleanly as a namespace package, with
+    # no code in it — so `import matgl` succeeds against the leftovers of a
+    # half-removed install and the operation gets advertised anyway. Found while
+    # trying to simulate a missing calculator by masking its directory.
+    # A namespace package is the one kind of module with no origin but a search
+    # path; that distinguishes it from a builtin, which has an origin.
+    spec = getattr(module, "__spec__", None)
+    if spec is not None and spec.origin is None and spec.submodule_search_locations is not None:
+        return False, "namespace package with no module code — the package is not really installed here"
     return True, None
 
 
@@ -102,5 +111,14 @@ def available_backends(registry: list[dict[str, Any]], operation: str) -> list[s
     advertises only what this image can actually run, so a consumer can trust
     the advertisement flatly instead of holding a precedence rule between a
     document and an endpoint.
+
+    Args:
+        registry: Backend entries, each with an `id`, a `probe_module`, and an
+            `operations` list naming every operation it can serve. A backend
+            appears under an operation only by being listed there — which is
+            what keeps a formation-energy predictor out of `relax`.
+        operation: The operation being asked about.
     """
-    return [entry["id"] for entry in registry if entry.get("operation") == operation and probe_import(entry["probe_module"])[0]]
+    return [
+        entry["id"] for entry in registry if operation in entry.get("operations", ()) and probe_import(entry["probe_module"])[0]
+    ]

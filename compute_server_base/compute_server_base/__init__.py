@@ -16,6 +16,8 @@ from compute_server_base.capabilities import (
     under_emulation,
 )
 from compute_server_base.jobs import TERMINAL_STATUSES, JobManager, JobStatus
+from compute_server_base.knowledge import KnowledgeDoc, load_knowledge, reconcile, search
+from compute_server_base.mcp_facade import mount_mcp
 
 __all__ = [
     "TERMINAL_STATUSES",
@@ -24,11 +26,16 @@ __all__ = [
     "JobManager",
     "JobRequest",
     "JobStatus",
+    "KnowledgeDoc",
     "Operation",
     "available_backends",
     "check_ws_token",
     "create_app",
+    "load_knowledge",
+    "mount_mcp",
     "probe_import",
+    "reconcile",
     "require_token",
+    "search",
     "under_emulation",
 ]

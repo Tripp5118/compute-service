@@ -14,6 +14,10 @@ authors = [
 dependencies = [
     "fastapi>=0.115",
     "pydantic>=2.9",
+    # The MCP facade (S-2b). Pinned to the 2.x line because 2.0 renamed the
+    # server class FastMCP -> MCPServer and the client entry point to
+    # streamable_http_client; 1.x will not import this package's code.
+    "mcp>=2.0,<3",
 ]
 
 # hatchling, not the repo's usual uv_build: uv_build is a Rust binary, and the
