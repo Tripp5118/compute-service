@@ -6,6 +6,15 @@ dict of input variables; the worker execs the source into a fresh
 namespace, calls the named entrypoint function with the variables as
 kwargs, and captures whatever dict it returns as the job's result.
 
+Each job also owns a directory on disk (`workspace_root()/<job_id>`), made the
+process's cwd while its code runs. For several tools the real output *is*
+files rather than a return value — a LAMMPS run writes a log, dump files, a
+restart — and those are routinely large enough that carrying them through the
+JSON result would be absurd. So the result stays small and carries a manifest
+of what was written; the files themselves are fetched over the /jobs/{id}/files
+routes in app.py. Nothing prunes the workspace automatically; see
+JobManager.discard_workspace.
+
 Trust model: since this executes arbitrary submitted code with the
 container's full privileges, the bearer token is the only boundary. That's
 an accepted tradeoff for a LAN-only service shared between trusted
@@ -24,12 +33,36 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import shutil
+import tempfile
 import time
 import traceback
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
+
+# Each instance's compose file backs this with a volume. Overridable so the
+# server still runs outside a container.
+_DEFAULT_WORKSPACE_ROOT = "/work/jobs"
+
+
+def workspace_root() -> Path:
+    """Directory holding one subdirectory per job.
+
+    Falls back to a temp directory when the configured root cannot be created,
+    so a bare `uvicorn` run or a test session gets a working server rather than
+    a failure at first submit.
+    """
+    root = Path(os.environ.get("JOB_WORKSPACE_ROOT", _DEFAULT_WORKSPACE_ROOT))
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        root = Path(tempfile.gettempdir()) / "compute-server-jobs"
+        root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 class JobStatus(str, Enum):  # noqa: UP042 — StrEnum needs 3.11; thermocalc's image is 3.10, see below
@@ -63,6 +96,8 @@ class Job:
         correlation_id: Caller-supplied id (e.g. MatFlow's task_id) for
             matching this job back to the right subscriber.
         timeout_s: Soft timeout — see module docstring for what "soft" means here.
+        workdir: This job's private directory, and its cwd while it runs.
+            Anything it writes with a relative path lands here.
     """
 
     id: str
@@ -71,6 +106,7 @@ class Job:
     variables: dict[str, Any]
     correlation_id: str | None
     timeout_s: float | None
+    workdir: Path | None = None
     status: JobStatus = JobStatus.QUEUED
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
@@ -116,6 +152,28 @@ class Job:
         if queue in self.subscribers:
             self.subscribers.remove(queue)
 
+    def files(self) -> list[dict[str, Any]]:
+        """Everything the job wrote, as {path, size_bytes, modified} entries.
+
+        Path-sorted rather than time-sorted: a consumer reading a manifest
+        wants `log.lammps` in the same position on every run.
+        """
+        if self.workdir is None or not self.workdir.is_dir():
+            return []
+        entries = []
+        for path in sorted(self.workdir.rglob("*")):
+            if not path.is_file():
+                continue
+            stat = path.stat()
+            entries.append(
+                {
+                    "path": path.relative_to(self.workdir).as_posix(),
+                    "size_bytes": stat.st_size,
+                    "modified": stat.st_mtime,
+                }
+            )
+        return entries
+
     def wall_time_s(self) -> float | None:
         """Elapsed run time, or None if the job hasn't started or finished yet."""
         if self.started_at is None or self.finished_at is None:
@@ -151,15 +209,28 @@ def _run_job_code(job: Job, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
     stdout_writer = _JobLogWriter(job, loop, "info")
     stderr_writer = _JobLogWriter(job, loop, "error")
 
-    namespace: dict[str, Any] = {}
-    with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
-        exec(compile(job.code, f"<job:{job.id}>", "exec"), namespace)
+    # WORKDIR as a module-level global, and the cwd set to the same place: job
+    # code that names its output files relatively (which is what a wrapped
+    # command-line tool does) writes into the workspace without being told to.
+    #
+    # ponytail: os.chdir is process-global, and this is only safe because the
+    # worker runs exactly one job at a time. A second worker means moving
+    # execution into a subprocess, not adding a lock.
+    namespace: dict[str, Any] = {"WORKDIR": str(job.workdir) if job.workdir is not None else None}
+    previous_cwd = Path.cwd()
+    if job.workdir is not None:
+        os.chdir(job.workdir)
+    try:
+        with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
+            exec(compile(job.code, f"<job:{job.id}>", "exec"), namespace)
 
-        entrypoint = namespace.get(job.entrypoint)
-        if entrypoint is None or not callable(entrypoint):
-            raise NameError(f"submitted code does not define a callable {job.entrypoint!r} entrypoint")
+            entrypoint = namespace.get(job.entrypoint)
+            if entrypoint is None or not callable(entrypoint):
+                raise NameError(f"submitted code does not define a callable {job.entrypoint!r} entrypoint")
 
-        result = entrypoint(**job.variables)
+            result = entrypoint(**job.variables)
+    finally:
+        os.chdir(previous_cwd)
 
     if not isinstance(result, dict):
         raise TypeError(f"entrypoint {job.entrypoint!r} must return a dict, got {type(result).__name__}")
@@ -192,13 +263,17 @@ class JobManager:
         timeout_s: float | None,
     ) -> Job:
         """Register a new job and enqueue it for the worker."""
+        job_id = uuid.uuid4().hex
+        workdir = workspace_root() / job_id
+        workdir.mkdir(parents=True, exist_ok=True)
         job = Job(
-            id=uuid.uuid4().hex,
+            id=job_id,
             code=code,
             entrypoint=entrypoint or "run",
             variables=variables or {},
             correlation_id=correlation_id,
             timeout_s=timeout_s,
+            workdir=workdir,
         )
         self._jobs[job.id] = job
         await self._queue.put(job)
@@ -221,6 +296,19 @@ class JobManager:
             job.cancel_requested = True
             return True
         return False
+
+    def discard_workspace(self, job_id: str) -> bool:
+        """Delete a job's files once the caller has what it wants.
+
+        ponytail: no TTL sweeper. Retention is the caller's call because only
+        the caller knows whether a 40 GB trajectory is still wanted; add a
+        sweeper when a disk actually fills.
+        """
+        job = self._jobs.get(job_id)
+        if job is None or job.workdir is None:
+            return False
+        shutil.rmtree(job.workdir, ignore_errors=True)
+        return True
 
     async def _worker(self) -> None:
         loop = asyncio.get_running_loop()

@@ -40,6 +40,12 @@ if TYPE_CHECKING:
     from compute_server_base.knowledge import KnowledgeDoc
 
 
+# An agent reading a log wants the end of a stack trace, not a megabyte of
+# thermo output it has to pay for. Anything bigger belongs on the HTTP route.
+_MAX_READ_BYTES = 64_000
+_BINARY_SNIFF_BYTES = 8_000
+
+
 def _bearer_guard(inner: Any) -> Any:
     """Wrap the mounted MCP app in the same bearer check the REST routes use.
 
@@ -106,8 +112,11 @@ def mount_mcp(
     operations = {op.name: op.backends for op in capabilities.operations}
     docs = reconcile(load_knowledge(knowledge_dir), operations) if knowledge_dir else []
 
+    # Built outside the f-string: nesting the same quote character inside one is
+    # a 3.12 feature, and this package has to import on thermocalc's 3.10.
+    advertised = "; ".join("{} ({})".format(op.name, ", ".join(op.backends)) for op in capabilities.operations)
     instructions = (
-        f"{tool_name} runs {'; '.join(f'{op.name} ({", ".join(op.backends)})' for op in capabilities.operations)}. "
+        f"{tool_name} runs {advertised}. "
         "Jobs are asynchronous: submit_* returns a job id, then poll get_job and read get_result. "
         "Everything advertised here has been checked against this image at startup, so you can trust "
         "the list rather than a document. Planning is yours; this server executes and answers questions."
@@ -198,6 +207,52 @@ def _register_job_tools(mcp: MCPServer, *, manager: JobManager, tool_name: str) 
     async def cancel_job(job_id: str) -> dict[str, Any]:
         ok = await manager.cancel(job_id)
         return {"job_id": job_id, "cancelled": ok} if ok else {"error": "job not found", "job_id": job_id}
+
+    @mcp.tool(
+        description=(
+            "Files a job wrote, with sizes — for tools whose real output is files (a log, a trajectory, a restart) "
+            "rather than a return value. Read a small one with read_job_file; fetch a large one over HTTP from "
+            "GET /jobs/{job_id}/files/{path}, and never try to pull a trajectory through this conversation."
+        )
+    )
+    async def list_job_files(job_id: str) -> dict[str, Any]:
+        job = manager.get(job_id)
+        if job is None:
+            return {"error": "job not found", "job_id": job_id}
+        files = job.files()
+        return {"job_id": job_id, "files": files, "total_bytes": sum(f["size_bytes"] for f in files)}
+
+    @mcp.tool(
+        description=(
+            "Read one text file from a job's workspace — a log, a thermo table, a small data file. "
+            f"Truncated at {_MAX_READ_BYTES} bytes; binary files are refused. Paths come from list_job_files."
+        )
+    )
+    async def read_job_file(job_id: str, path: str, max_bytes: int = _MAX_READ_BYTES) -> dict[str, Any]:
+        job = manager.get(job_id)
+        if job is None:
+            return {"error": "job not found", "job_id": job_id}
+        if job.workdir is None:
+            return {"error": "job has no workspace", "job_id": job_id}
+        root = job.workdir.resolve()
+        target = (root / path).resolve()
+        if (root != target and root not in target.parents) or not target.is_file():
+            return {"error": "file not found", "path": path}
+        limit = max(1, min(int(max_bytes), _MAX_READ_BYTES))
+        raw = target.read_bytes()
+        if b"\x00" in raw[:_BINARY_SNIFF_BYTES]:
+            return {
+                "error": "file looks binary — fetch it over HTTP instead",
+                "path": path,
+                "size_bytes": len(raw),
+            }
+        text = raw[:limit].decode("utf-8", "replace")
+        return {
+            "path": path,
+            "size_bytes": len(raw),
+            "truncated": len(raw) > limit,
+            "text": text,
+        }
 
 
 def _body_reader(body: str, name: str) -> Callable[[], str]:

@@ -13,10 +13,15 @@ deprecated /manifest and /mlips shims survive their migration period.
 from __future__ import annotations
 
 import contextlib
+import tarfile
+import tempfile
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from compute_server_base.auth import check_ws_token, require_token, set_audience
 
@@ -121,15 +126,85 @@ def create_app(
             raise HTTPException(status_code=404, detail="job not found")
         if job.status not in TERMINAL_STATUSES:
             raise HTTPException(status_code=409, detail=f"job is {job.status.value}, not finished yet")
+        # The manifest travels with the result, the files do not: one call
+        # tells a caller both what the job computed and what it wrote, without
+        # putting a multi-gigabyte dump inside a JSON body.
         return {
             "status": job.status.value,
             "values": job.values,
             "error": job.error,
+            "files": job.files(),
             "provenance": {
                 "tool_name": tool_name,
                 "wall_time_s": job.wall_time_s(),
             },
         }
+
+    def _job_or_404(job_id: str) -> Any:
+        job = manager.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        return job
+
+    def _resolve_in_workspace(job: Any, relative_path: str) -> Path:
+        """Resolve a caller-supplied path, refusing anything outside the workspace.
+
+        `resolve()` before the containment check, so `../` and a symlink
+        planted by the job's own code are both caught by the same test.
+        """
+        if job.workdir is None:
+            raise HTTPException(status_code=404, detail="job has no workspace")
+        root = job.workdir.resolve()
+        target = (root / relative_path).resolve()
+        if root != target and root not in target.parents:
+            raise HTTPException(status_code=404, detail="file not found")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="file not found")
+        return target
+
+    @app.get("/jobs/{job_id}/files", dependencies=[Depends(require_token)])
+    async def job_files(job_id: str) -> dict[str, Any]:
+        """What the job wrote — path, size and mtime, no contents."""
+        job = _job_or_404(job_id)
+        files = job.files()
+        return {"files": files, "total_bytes": sum(f["size_bytes"] for f in files)}
+
+    @app.get("/jobs/{job_id}/files/{file_path:path}", dependencies=[Depends(require_token)])
+    async def job_file(job_id: str, file_path: str) -> FileResponse:
+        """Stream one file out of the job's workspace."""
+        job = _job_or_404(job_id)
+        return FileResponse(_resolve_in_workspace(job, file_path), filename=Path(file_path).name)
+
+    @app.get("/jobs/{job_id}/archive", dependencies=[Depends(require_token)])
+    async def job_archive(job_id: str) -> FileResponse:
+        """The whole workspace as a tar.gz, for a caller that wants everything.
+
+        Built into a temp file and deleted after the response, rather than
+        streamed: gzip through a pipe would block the event loop, and a run
+        directory big enough for that to matter should be fetched file by file
+        against the manifest anyway.
+        """
+        job = _job_or_404(job_id)
+        if job.workdir is None or not job.workdir.is_dir():
+            raise HTTPException(status_code=404, detail="job has no workspace")
+        handle = tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False)  # noqa: SIM115 — closed below, unlinked by the background task
+        handle.close()
+        archive = Path(handle.name)
+        with tarfile.open(archive, "w:gz") as tar:
+            tar.add(job.workdir, arcname=job_id)
+        return FileResponse(
+            archive,
+            media_type="application/gzip",
+            filename=f"{job_id}.tar.gz",
+            background=BackgroundTask(archive.unlink),
+        )
+
+    @app.delete("/jobs/{job_id}/files", dependencies=[Depends(require_token)])
+    async def discard_job_files(job_id: str) -> dict[str, str]:
+        """Delete the job's workspace. Nothing else reclaims it — see jobs.py."""
+        _job_or_404(job_id)
+        manager.discard_workspace(job_id)
+        return {"status": "ok"}
 
     @app.post("/jobs/{job_id}/cancel", dependencies=[Depends(require_token)])
     async def cancel_job(job_id: str) -> dict[str, str]:
