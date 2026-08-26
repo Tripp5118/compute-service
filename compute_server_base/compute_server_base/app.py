@@ -18,8 +18,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
@@ -30,6 +30,7 @@ from compute_server_base.auth import check_ws_token, require_token, set_audience
 # ref it can't resolve fails at request time, not import time.
 from compute_server_base.capabilities import Capabilities  # noqa: TC001 — see above; must resolve at runtime
 from compute_server_base.jobs import TERMINAL_STATUSES, JobManager
+from compute_server_base.refusal import RefusalReason, Refused, not_ready_detail, refuse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -104,9 +105,18 @@ def create_app(
         """What this instance can do and whether it can do it on this host."""
         return capabilities()
 
+    # A refusal is the same body on both faces (see refusal.py). Routes raise
+    # it; this turns it into 422 rather than letting it surface as a 500, which
+    # is what "this broke" looks like and is exactly the confusion being fixed.
+    @app.exception_handler(Refused)
+    async def _refused(_request: Request, exc: Refused) -> JSONResponse:
+        return JSONResponse(status_code=422, content=exc.refusal.model_dump(mode="json"))
+
     @app.post("/jobs", dependencies=[Depends(require_token)])
     async def create_job(req: JobRequest) -> dict[str, str]:
         """Enqueue a job; returns immediately with a job_id in queued status."""
+        if not capabilities().ready:
+            raise refuse(RefusalReason.INSTANCE_NOT_READY, not_ready_detail(tool_name))
         job = await manager.submit(req.code, req.entrypoint, req.variables, req.correlation_id, req.timeout_s)
         return {"job_id": job.id, "status": job.status.value}
 

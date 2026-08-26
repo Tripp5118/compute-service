@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 from compute_server_base.auth import check_ws_token
 from compute_server_base.jobs import TERMINAL_STATUSES
 from compute_server_base.knowledge import load_knowledge, reconcile, search
+from compute_server_base.refusal import RefusalReason, not_ready_detail, refusal
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -129,7 +130,7 @@ def mount_mcp(
             continue
         _register_submit(mcp, operation=operation, builder=builder, manager=manager)
 
-    _register_job_tools(mcp, manager=manager, tool_name=tool_name)
+    _register_job_tools(mcp, manager=manager, tool_name=tool_name, capabilities=capabilities)
     _register_knowledge(mcp, docs=docs, scheme=scheme)
 
     mcp_app = mcp.streamable_http_app(streamable_http_path="/")
@@ -155,12 +156,13 @@ def _register_submit(
         "Returns a job id immediately — this does not wait for the calculation."
     )
 
-    async def submit(backend: str, arguments: dict[str, Any], correlation_id: str | None = None) -> dict[str, str]:
+    async def submit(backend: str, arguments: dict[str, Any], correlation_id: str | None = None) -> dict[str, Any]:
         if backend not in operation.backends:
-            return {
-                "error": f"backend {backend!r} does not serve {operation.name} on this instance",
-                "available": ", ".join(operation.backends),
-            }
+            return refusal(
+                RefusalReason.BACKEND_NOT_SERVED,
+                f"backend {backend!r} does not serve {operation.name} on this instance",
+                available=operation.backends,
+            )
         code, variables = builder(backend=backend, **arguments)
         job = await manager.submit(code, "run", variables, correlation_id, None)
         return {"job_id": job.id, "status": job.status.value}
@@ -169,8 +171,51 @@ def _register_submit(
     mcp.tool(name=f"submit_{operation.name}", description=description)(submit)
 
 
-def _register_job_tools(mcp: MCPServer, *, manager: JobManager, tool_name: str) -> None:
-    """Register the poll/read/cancel half of the async job pattern."""
+def _register_job_tools(mcp: MCPServer, *, manager: JobManager, tool_name: str, capabilities: Capabilities) -> None:
+    """Register the generic submit, the descriptor read, and the poll/read/cancel half."""
+
+    @mcp.tool(
+        description=(
+            "Run code you have written yourself on this instance — the general path, and the one to reach "
+            "for when no submit_* operation above fits what you need to calculate.\n\n"
+            "`code` is a source file. It must define a function named by `entrypoint` (default `run`), which "
+            "is called with `variables` as keyword arguments and should return a JSON-serializable value; that "
+            "value comes back from get_result. Anything the code prints is relayed to the job's log. The "
+            "process runs with the job's own directory as its working directory, so a relative path written by "
+            "your code lands somewhere list_job_files and read_job_file can reach.\n\n"
+            "For what is importable here, and worked examples, read this tool's knowledge pack — "
+            "search_workflows finds it.\n\n"
+            "Returns a job id immediately; this does not wait for the calculation."
+        )
+    )
+    async def submit_code(
+        code: str,
+        entrypoint: str = "run",
+        variables: dict[str, Any] | None = None,
+        correlation_id: str | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        # ponytail: `capabilities` is the startup snapshot, so an instance that
+        # loses its engine mount after startup fails the job at runtime instead
+        # of refusing it — the behaviour that existed before this guard. Thread
+        # a live callable through mount_mcp if that ever costs anything real.
+        if not capabilities.ready:
+            return refusal(RefusalReason.INSTANCE_NOT_READY, not_ready_detail(tool_name))
+        job = await manager.submit(code, entrypoint or "run", variables or {}, correlation_id, timeout_s)
+        return {"job_id": job.id, "status": job.status.value}
+
+    @mcp.tool(
+        description=(
+            "This instance's full capability descriptor: identity, version, contract version, whether it is "
+            "ready, the operations it serves with their backends, and the host block.\n\n"
+            "Read the host block before trusting a number off this instance. `under_emulation` true means the "
+            "solver is running on an architecture it was not built for, and `arch_match` false means the same "
+            "thing from the other direction; a result produced either way is validated against a native run "
+            "before it is used."
+        )
+    )
+    async def get_capabilities() -> dict[str, Any]:
+        return capabilities.model_dump(mode="json")
 
     @mcp.tool(description="Current status of a submitted job: queued, running, succeeded, failed or cancelled.")
     async def get_job(job_id: str) -> dict[str, Any]:

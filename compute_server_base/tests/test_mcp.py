@@ -219,8 +219,8 @@ def test_submit_poll_and_read_over_mcp(wired: tuple[Any, Any]) -> None:
     assert payload["provenance"]["tool_name"] == "stub"
 
 
-def test_submit_rejects_a_backend_that_does_not_serve_the_operation(wired: tuple[Any, Any]) -> None:
-    """Rejected before it becomes a job, so the failure is legible instead of a traceback."""
+def test_submit_refuses_a_backend_that_does_not_serve_the_operation(wired: tuple[Any, Any]) -> None:
+    """Refused before it becomes a job, and refused as a value an agent can branch on."""
     app, server = wired
 
     async def flow() -> dict[str, Any]:
@@ -228,8 +228,117 @@ def test_submit_rejects_a_backend_that_does_not_serve_the_operation(wired: tuple
         return result.structured_content
 
     payload = _run(app, flow)
-    assert "error" in payload
-    assert "absent" in payload["error"]
+    assert payload["refused"] is True
+    assert payload["reason"] == "backend_not_served"
+    assert "absent" in payload["detail"]
+    # The context is what makes it actionable: an agent retries with one of these.
+    assert payload["context"]["available"] == ["installed"]
+
+
+def test_arbitrary_code_can_be_submitted_over_mcp(wired: tuple[Any, Any]) -> None:
+    """S-16. Named operations are the convenience path; this is the one the servers exist for."""
+    app, server = wired
+
+    async def flow() -> dict[str, Any]:
+        submitted = await server.call_tool(
+            "submit_code",
+            {
+                "code": "def measure(a, b):\n    return {'sum': a + b}\n",
+                "entrypoint": "measure",
+                "variables": {"a": 2, "b": 5},
+            },
+        )
+        job_id = submitted.structured_content["job_id"]
+        for _ in range(300):
+            status = await server.call_tool("get_job", {"job_id": job_id})
+            if status.structured_content["status"] in ("succeeded", "failed", "cancelled"):
+                break
+            await asyncio.sleep(0.1)
+        result = await server.call_tool("get_result", {"job_id": job_id})
+        return result.structured_content
+
+    payload = _run(app, flow)
+    assert payload["status"] == "succeeded"
+    # Not an operation in the registry, and no builder — the point of S-16.
+    assert payload["values"] == {"sum": 7}
+
+
+def test_capability_descriptor_is_readable_over_mcp(wired: tuple[Any, Any]) -> None:
+    """S-17. An agent has to see the host facts, not only the tool list generated from them."""
+    app, server = wired
+
+    async def flow() -> dict[str, Any]:
+        result = await server.call_tool("get_capabilities", {})
+        return result.structured_content
+
+    payload = _run(app, flow)
+    over_rest = _capabilities().model_dump(mode="json")
+
+    # The two faces must not be able to disagree about what this host is: the
+    # MCP read and the REST route serve the same descriptor object.
+    assert payload["host"] == over_rest["host"]
+    assert payload["contract_version"] == over_rest["contract_version"]
+    assert payload["version"] == over_rest["version"]
+    # under_emulation is the field the whole item exists for: it decides whether
+    # a number off this instance gets validated before use.
+    assert "under_emulation" in payload["host"]
+
+
+def _not_ready() -> Capabilities:
+    """An instance whose compute is absent — thermocalc with no engine bind-mounted."""
+    return Capabilities(
+        tool="stub",
+        version="0.0",
+        contract_version="1.0",
+        ready=False,
+        host=Host(container_arch="x86_64", solver_arch=None, arch_match=None),
+        operations=[],
+    )
+
+
+def _not_ready_app(knowledge_dir: Path) -> tuple[Any, Any]:
+    """A wired not-ready instance. Built per call: one session manager, one run."""
+    holder: dict[str, Any] = {}
+
+    def _mount(app: Any) -> Any:
+        holder["server"] = mount_mcp(
+            app,
+            tool_name="stub",
+            capabilities=_not_ready(),
+            manager=app.state.jobs,
+            job_builders={},
+            knowledge_dir=knowledge_dir,
+            uri_scheme="stub",
+        )
+        return holder["server"]
+
+    app = create_app(tool_name="stub", capabilities=_not_ready, mcp_mount=_mount)
+    return app, holder["server"]
+
+
+def test_a_not_ready_instance_refuses_on_both_faces(knowledge_dir: Path) -> None:
+    """S-18. The same body over HTTP and over MCP, so a client reads one shape.
+
+    Two apps, not one: the streamable-HTTP session manager can only be run
+    once, so a TestClient and a driven MCPServer cannot share an instance.
+    """
+    rest_app, _ = _not_ready_app(knowledge_dir)
+    with TestClient(rest_app) as client:
+        response = client.post("/jobs", json={"code": "def run():\n    return 1\n"}, headers=AUTH)
+    assert response.status_code == 422, "a refusal is not a 500 — 'will not' and 'broke' are different outcomes"
+    over_rest = response.json()
+
+    mcp_app, server = _not_ready_app(knowledge_dir)
+
+    async def flow() -> dict[str, Any]:
+        result = await server.call_tool("submit_code", {"code": "def run():\n    return 1\n"})
+        return result.structured_content
+
+    over_mcp = _run(mcp_app, flow)
+
+    assert over_rest == over_mcp, "one refusal shape, whichever face the caller is on"
+    assert over_rest["refused"] is True
+    assert over_rest["reason"] == "instance_not_ready"
 
 
 def test_knowledge_is_reconciled_against_live_operations(wired: tuple[Any, Any]) -> None:
