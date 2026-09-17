@@ -20,21 +20,25 @@ container's full privileges, the bearer token is the only boundary. That's
 an accepted tradeoff for a LAN-only service shared between trusted
 first-party backends (MatFlow, [other project]) — not a public API.
 
-Known v1 limitations, both inherent to running jobs via a thread pool
-executor rather than a subprocess:
-  - Cancelling a *running* job is best-effort: the underlying thread can't
-    be interrupted mid-exec, so cancel only discards its eventual result.
-  - A timeout is enforced the same way: past timeout_s the job is marked
-    failed, but the thread keeps running in the background until it
-    finishes on its own.
+Each job runs in a child process (`_job_runner.py`), in its own session, and
+`timeout_s` and `cancel` kill that session's process group. Until 2026-09-04
+execution lived in a thread pool thread instead, which meant neither could stop
+anything: a thread cannot be interrupted, so a timed-out job was marked failed
+and went on computing until the container was restarted. One did, for 19 hours,
+holding 19 cores and 44 GB. The process group rather than the process alone
+because job code may spawn its own subprocesses — LAMMPS jobs run `lmp` under
+`Popen`, and killing only the Python child would orphan the solver.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
+import signal
+import sys
 import tempfile
 import time
 import traceback
@@ -47,6 +51,15 @@ from typing import Any
 # Each instance's compose file backs this with a volume. Overridable so the
 # server still runs outside a container.
 _DEFAULT_WORKSPACE_ROOT = "/work/jobs"
+
+# How long the child's pipes are still read after the child itself has exited.
+# Only a leaked process holds them open that late, and its output belongs to a
+# job that has already finished.
+_PUMP_GRACE_S = 5.0
+
+# How often the child is checked for having exited. One job runs at a time, so
+# this is one wakeup per interval for the whole server.
+_EXIT_POLL_S = 0.05
 
 
 def workspace_root() -> Path:
@@ -95,9 +108,13 @@ class Job:
         variables: Input variable bindings passed to the entrypoint as kwargs.
         correlation_id: Caller-supplied id (e.g. MatFlow's task_id) for
             matching this job back to the right subscriber.
-        timeout_s: Soft timeout — see module docstring for what "soft" means here.
+        timeout_s: Wall-clock limit. On expiry the job's process group is killed.
         workdir: This job's private directory, and its cwd while it runs.
             Anything it writes with a relative path lands here.
+        pgid: Process-group id of the child running this job, while it runs.
+            `cancel()` needs it to kill something. The group id rather than the
+            process handle because the group outlives the child it was named
+            for, and killing the group is what reaches a solver the job spawned.
     """
 
     id: str
@@ -107,6 +124,7 @@ class Job:
     correlation_id: str | None
     timeout_s: float | None
     workdir: Path | None = None
+    pgid: int | None = None
     status: JobStatus = JobStatus.QUEUED
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
@@ -181,60 +199,150 @@ class Job:
         return self.finished_at - self.started_at
 
 
-class _JobLogWriter:
-    """File-like object redirecting a job's stdout/stderr into its log stream."""
+class JobFailed(Exception):
+    """The job's code raised, or its process died. Carries the child's traceback."""
 
-    def __init__(self, job: Job, loop: asyncio.AbstractEventLoop, level: str) -> None:
-        self._job = job
-        self._loop = loop
-        self._level = level
-        self._buffer = ""
+    def __init__(self, message: str, job_traceback: str | None = None) -> None:
+        super().__init__(message)
+        self.job_traceback = job_traceback
 
-    def write(self, text: str) -> int:
-        self._buffer += text
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
+
+def kill_process_group(pgid: int | None) -> None:
+    """SIGKILL a job's whole session, so a solver it spawned dies with it.
+
+    No SIGTERM first: by the time this is called the job's outcome is already
+    settled, so nothing is waiting on a graceful exit.
+
+    Takes the group id, not the process handle: it is also called *after* the
+    child has been reaped, when `os.getpgid` would raise for the dead leader
+    while the group's surviving members still hold cores, memory and pipes.
+    """
+    if pgid is None:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+
+async def _pump(stream: asyncio.StreamReader, job: Job, level: str) -> None:
+    """Publish the child's output a line at a time as it arrives.
+
+    Chunked rather than `readline()` because a job that prints one enormous
+    line — a whole array, say — would otherwise trip StreamReader's limit and
+    lose the rest of its output.
+    """
+    buffer = ""
+    while True:
+        chunk = await stream.read(8192)
+        if not chunk:
+            break
+        buffer += chunk.decode("utf-8", errors="replace")
+        while "\n" in buffer:
+            line, buffer = buffer.split("\n", 1)
             if line:
-                self._loop.call_soon_threadsafe(self._job.publish_log, self._level, line)
-        return len(text)
-
-    def flush(self) -> None:
-        pass
+                job.publish_log(level, line)
+    if buffer.strip():
+        job.publish_log(level, buffer)
 
 
-def _run_job_code(job: Job, loop: asyncio.AbstractEventLoop) -> dict[str, Any]:
-    """Exec the job's source and call its entrypoint. Runs in a worker thread."""
-    import contextlib
+async def _wait_for_exit(process: asyncio.subprocess.Process) -> int:
+    """Wait until the child itself exits, whatever is still holding its pipes.
 
-    stdout_writer = _JobLogWriter(job, loop, "info")
-    stderr_writer = _JobLogWriter(job, loop, "error")
+    Deliberately not `process.wait()`: asyncio resolves that only once the
+    process has exited *and* every pipe has disconnected, and a pipe stays
+    connected while any process holds the write end. So a job that returns while
+    leaving a process running behind it — inheriting stdout, as every child does
+    — makes `process.wait()` outlive the child indefinitely, and with `timeout_s`
+    unset (its default) nothing ever interrupted that. The worker is the queue's
+    only consumer, so the whole queue stopped there.
 
-    # WORKDIR as a module-level global, and the cwd set to the same place: job
-    # code that names its output files relatively (which is what a wrapped
-    # command-line tool does) writes into the workspace without being told to.
-    #
-    # ponytail: os.chdir is process-global, and this is only safe because the
-    # worker runs exactly one job at a time. A second worker means moving
-    # execution into a subprocess, not adding a lock.
-    namespace: dict[str, Any] = {"WORKDIR": str(job.workdir) if job.workdir is not None else None}
-    previous_cwd = Path.cwd()
-    if job.workdir is not None:
-        os.chdir(job.workdir)
+    Polls `returncode`, which the child watcher sets when it reaps the process,
+    before any pipe bookkeeping.
+    """
+    while process.returncode is None:
+        await asyncio.sleep(_EXIT_POLL_S)
+    return process.returncode
+
+
+async def _run_job(job: Job) -> dict[str, Any]:
+    """Run the job's code in a child process and return the values it produced.
+
+    Raises:
+        asyncio.TimeoutError: The job outlived `timeout_s` and was killed.
+        JobFailed: The job's code raised, or its process died without reporting.
+    """
+    handle, result_path = tempfile.mkstemp(prefix=f"job-{job.id}-", suffix=".json")
+    os.close(handle)
+    request = json.dumps(
+        {
+            "job_id": job.id,
+            "code": job.code,
+            "entrypoint": job.entrypoint,
+            "variables": job.variables,
+            # Job code that names its output files relatively writes them into
+            # the workspace without being told to: the child's cwd is the
+            # workspace, and WORKDIR names it for code that would rather be
+            # explicit. The old in-process path did this with os.chdir, which
+            # is process-global and was only ever safe by luck.
+            "workdir": str(job.workdir) if job.workdir is not None else None,
+            "result_path": result_path,
+        }
+    )
     try:
-        with contextlib.redirect_stdout(stdout_writer), contextlib.redirect_stderr(stderr_writer):
-            exec(compile(job.code, f"<job:{job.id}>", "exec"), namespace)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "compute_server_base._job_runner",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(job.workdir) if job.workdir is not None else None,
+            # Its own session, so one kill reaches anything the job spawned.
+            start_new_session=True,
+            # Otherwise the child block-buffers into the pipe and the live log
+            # stream arrives all at once when the job ends.
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        # start_new_session made the child its own session leader, so its pid is
+        # the group id of everything it goes on to spawn.
+        job.pgid = process.pid
+        pumps = asyncio.gather(
+            _pump(process.stdout, job, "info"),
+            _pump(process.stderr, job, "error"),
+        )
+        try:
+            process.stdin.write(request.encode())
+            await process.stdin.drain()
+            process.stdin.close()
+            # asyncio.TimeoutError, not the builtin: they are the same class only
+            # from 3.11, and this package still runs on thermocalc's 3.10 image.
+            await asyncio.wait_for(_wait_for_exit(process), timeout=job.timeout_s)
+        finally:
+            # Kill the group on *every* path out, not just timeout and cancel. A
+            # job that returns while leaving a process running behind it — a
+            # Popen it never waited on, a pool it never joined — otherwise leaves
+            # that process holding cores and memory nobody is waiting for, the
+            # same class of leak as the 19-hour runaway, and holding this pipe.
+            kill_process_group(job.pgid)
+            # Bounded, because _pump waits for EOF and EOF needs every writer
+            # closed. A process that escaped the group above still holds the
+            # write end, and waiting for it stalled this worker — and therefore
+            # every job queued behind it — permanently. `timeout_s` did not help:
+            # it guards the child's exit, which had already happened.
+            try:
+                await asyncio.wait_for(pumps, timeout=_PUMP_GRACE_S)
+            except asyncio.TimeoutError:
+                job.publish_log("error", "stopped reading job output: a process it spawned still holds the log pipe")
 
-            entrypoint = namespace.get(job.entrypoint)
-            if entrypoint is None or not callable(entrypoint):
-                raise NameError(f"submitted code does not define a callable {job.entrypoint!r} entrypoint")
-
-            result = entrypoint(**job.variables)
+        outcome_text = Path(result_path).read_text() if Path(result_path).stat().st_size else ""
+        if not outcome_text:
+            raise JobFailed(f"job process exited with code {process.returncode} without reporting a result")
+        outcome = json.loads(outcome_text)
+        if not outcome["ok"]:
+            raise JobFailed(outcome["error"], outcome.get("traceback"))
+        return outcome["values"]
     finally:
-        os.chdir(previous_cwd)
-
-    if not isinstance(result, dict):
-        raise TypeError(f"entrypoint {job.entrypoint!r} must return a dict, got {type(result).__name__}")
-    return result
+        job.pgid = None
+        Path(result_path).unlink(missing_ok=True)
 
 
 class JobManager:
@@ -284,7 +392,7 @@ class JobManager:
         return self._jobs.get(job_id)
 
     async def cancel(self, job_id: str) -> bool:
-        """Cancel a queued job outright, or flag a running one (best-effort)."""
+        """Cancel a queued job outright, or kill a running one."""
         job = self._jobs.get(job_id)
         if job is None:
             return False
@@ -294,8 +402,25 @@ class JobManager:
             return True
         if job.status == JobStatus.RUNNING:
             job.cancel_requested = True
+            kill_process_group(job.pgid)
             return True
         return False
+
+    def all_jobs(self) -> list[Job]:
+        """Every job this process knows about, newest first.
+
+        The queue had no window onto it, so "my job has been queued for an hour"
+        was a report nobody could check against anything.
+        """
+        return sorted(self._jobs.values(), key=lambda job: job.created_at, reverse=True)
+
+    def worker_alive(self) -> bool:
+        """Whether the one consumer of the queue is still running.
+
+        If this is False, every queued job stays queued forever. It is the first
+        thing to look at when nothing is progressing.
+        """
+        return self._worker_task is not None and not self._worker_task.done()
 
     def discard_workspace(self, job_id: str) -> bool:
         """Delete a job's files once the caller has what it wants.
@@ -311,47 +436,58 @@ class JobManager:
         return True
 
     async def _worker(self) -> None:
-        loop = asyncio.get_running_loop()
         while True:
             job = await self._queue.get()
-            if job.status == JobStatus.CANCELLED:
-                continue
-
-            job.status = JobStatus.RUNNING
-            job.started_at = time.monotonic()
-            job.publish_log("info", f"job {job.id} started")
-
             try:
-                coro = loop.run_in_executor(None, _run_job_code, job, loop)
-                if job.timeout_s:
-                    values = await asyncio.wait_for(coro, timeout=job.timeout_s)
-                else:
-                    values = await coro
-            except TimeoutError:
-                job.status = JobStatus.FAILED
-                job.error = (
-                    f"job exceeded timeout_s={job.timeout_s}s (the underlying execution may still be running in the background)"
-                )
-                job.publish_terminal({"type": "error", "message": job.error})
-            except Exception as exc:  # noqa: BLE001 — job code is arbitrary, must not crash the worker
-                job.status = JobStatus.FAILED
-                job.error = str(exc)
-                job.traceback = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-                job.publish_terminal({"type": "error", "message": job.error, "traceback": job.traceback})
+                await self._run_one(job)
+            except Exception:  # noqa: BLE001 — see below
+                # Nothing may end this loop. It is the queue's only consumer, so
+                # an exception escaping it leaves every later job queued forever,
+                # with the traceback buried in a Task nobody awaits.
+                traceback.print_exc()
+
+    async def _run_one(self, job: Job) -> None:
+        if job.status == JobStatus.CANCELLED:
+            return
+
+        job.status = JobStatus.RUNNING
+        job.started_at = time.monotonic()
+        job.publish_log("info", f"job {job.id} started")
+
+        try:
+            values = await _run_job(job)
+        except asyncio.TimeoutError:
+            self._fail(job, f"job exceeded timeout_s={job.timeout_s}s and was killed")
+        except JobFailed as exc:
+            self._fail(job, str(exc), exc.job_traceback)
+        except Exception as exc:  # noqa: BLE001 — a failure to launch is this job's outcome, not the worker's
+            self._fail(job, str(exc), "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        else:
+            if job.cancel_requested:
+                job.status = JobStatus.CANCELLED
+                job.publish_terminal({"type": "error", "message": "cancelled"})
             else:
-                if job.cancel_requested:
-                    job.status = JobStatus.CANCELLED
-                    job.publish_terminal({"type": "error", "message": "cancelled"})
-                else:
-                    try:
-                        json.dumps(values)
-                    except TypeError as exc:
-                        job.status = JobStatus.FAILED
-                        job.error = f"entrypoint return value is not JSON-serializable: {exc}"
-                        job.publish_terminal({"type": "error", "message": job.error})
-                    else:
-                        job.values = values
-                        job.status = JobStatus.SUCCEEDED
-                        job.publish_terminal({"type": "result", "values": values})
-            finally:
-                job.finished_at = time.monotonic()
+                job.values = values
+                job.status = JobStatus.SUCCEEDED
+                job.publish_terminal({"type": "result", "values": values})
+        finally:
+            job.finished_at = time.monotonic()
+
+    @staticmethod
+    def _fail(job: Job, message: str, job_traceback: str | None = None) -> None:
+        """Record a terminal failure — or a cancellation, if that is what killed it.
+
+        A cancelled job's process dies mid-run and reports nothing, which is
+        indistinguishable from a crash except by `cancel_requested`.
+        """
+        if job.cancel_requested:
+            job.status = JobStatus.CANCELLED
+            job.publish_terminal({"type": "error", "message": "cancelled"})
+            return
+        job.status = JobStatus.FAILED
+        job.error = message
+        job.traceback = job_traceback
+        event = {"type": "error", "message": message}
+        if job_traceback:
+            event["traceback"] = job_traceback
+        job.publish_terminal(event)

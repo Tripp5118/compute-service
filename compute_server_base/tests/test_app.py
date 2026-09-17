@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -37,6 +38,28 @@ def run():
     return {}
 """
 
+# Writes both pids into the workspace before hanging, so the test can ask the
+# OS whether they are really gone rather than trusting the job's status.
+SPAWNS_AND_HANGS = """
+def run():
+    import os, subprocess, time
+    child = subprocess.Popen(["sleep", "300"])
+    with open("pids.txt", "w") as handle:
+        handle.write(f"{os.getpid()}\\n{child.pid}\\n")
+    time.sleep(300)
+    return {}
+"""
+
+
+# Returns promptly and leaves a process behind holding the inherited stdout —
+# a Popen the job never waited on, which is ordinary job code, not abuse.
+LEAKS_A_PROCESS = """
+def run():
+    import subprocess, sys
+    subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+    return {"leaked": True}
+"""
+
 
 def _capabilities() -> Capabilities:
     return Capabilities(
@@ -50,6 +73,19 @@ def _capabilities() -> Capabilities:
 
 
 app = create_app(tool_name="stub", capabilities=_capabilities)
+
+
+def _still_running(pid: int) -> bool:
+    """Whether a pid is a live process, reading /proc rather than signalling it.
+
+    `os.kill(pid, 0)` succeeds on a zombie, and a killed grandchild stays one
+    until something reaps it — in a container whose pid 1 is pytest, nothing does.
+    """
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[0]
+    except FileNotFoundError:
+        return False
+    return state != "Z"
 
 
 def _wait_for_terminal(client: TestClient, job_id: str, timeout_s: float = 30.0) -> dict:
@@ -116,6 +152,55 @@ def test_cancel_a_queued_job():
 
         assert client.post(f"/jobs/{job_id}/cancel", headers=AUTH).status_code == 200
         assert _wait_for_terminal(client, job_id)["status"] == "cancelled"
+
+
+def test_timeout_kills_the_job_and_anything_it_spawned():
+    """The one that matters: a timed-out job has to stop computing, not just stop being waited on.
+
+    Before jobs ran in a child process, `timeout_s` marked a job failed and left
+    it running — 19 cores and 44 GB for 19 hours, in the case that prompted this.
+    Asserting the status alone would have passed throughout.
+    """
+    with TestClient(app) as client:
+        job_id = client.post(
+            "/jobs",
+            headers=AUTH,
+            json={
+                "code": SPAWNS_AND_HANGS,
+                "timeout_s": 3,
+            },
+        ).json()["job_id"]
+
+        assert _wait_for_terminal(client, job_id)["status"] == "failed"
+        pids = client.get(f"/jobs/{job_id}/files/pids.txt", headers=AUTH)
+        assert pids.status_code == 200
+
+    # The grandchild is the LAMMPS-shaped case: job code that runs a solver under
+    # Popen. Killing only the job's own process would leave the solver running.
+    assert [pid for pid in (int(line) for line in pids.text.split()) if _still_running(pid)] == []
+
+
+def test_a_job_that_leaks_a_process_does_not_stall_the_queue():
+    """The stall: a job returned, left a process holding stdout, and the queue died.
+
+    Reading the child's output waits for EOF on its pipe, and EOF needs every
+    writer closed. A process the job left running behind it still holds the write
+    end, so the worker waited on it forever — and one worker runs one job at a
+    time, so every later job stayed queued. `timeout_s` did not help: it guards
+    the child's exit, which had already happened.
+
+    Asserting only the leaking job's own status would pass, as it did here: the
+    job whose status has to be checked is the one queued behind it.
+
+    No `timeout_s`, which is its default and the case with no way out: a timeout
+    would eventually have killed the group and freed the pipe.
+    """
+    with TestClient(app) as client:
+        client.post("/jobs", headers=AUTH, json={"code": LEAKS_A_PROCESS})
+        behind = client.post("/jobs", headers=AUTH, json={"code": ECHO, "variables": {"x": 1}}).json()["job_id"]
+
+        assert _wait_for_terminal(client, behind, timeout_s=45)["status"] == "succeeded"
+        assert client.get("/jobs", headers=AUTH).json()["worker_alive"] is True
 
 
 def test_stream_carries_log_and_result_events():

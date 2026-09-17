@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import tarfile
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -29,7 +30,7 @@ from compute_server_base.auth import check_ws_token, require_token, set_audience
 # annotation into a response model when the route is registered, and a forward
 # ref it can't resolve fails at request time, not import time.
 from compute_server_base.capabilities import Capabilities  # noqa: TC001 — see above; must resolve at runtime
-from compute_server_base.jobs import TERMINAL_STATUSES, JobManager
+from compute_server_base.jobs import TERMINAL_STATUSES, JobManager, JobStatus
 from compute_server_base.refusal import RefusalReason, Refused, not_ready_detail, refuse
 
 if TYPE_CHECKING:
@@ -120,6 +121,40 @@ def create_app(
         job = await manager.submit(req.code, req.entrypoint, req.variables, req.correlation_id, req.timeout_s)
         return {"job_id": job.id, "status": job.status.value}
 
+    # Registered before /jobs/{job_id} so the literal path is not eaten by it.
+    @app.get("/jobs", dependencies=[Depends(require_token)])
+    async def list_jobs() -> dict[str, Any]:
+        """Every job this process knows about, and whether the queue is moving.
+
+        There was no window onto the queue, so "jobs are sitting stale" was a
+        report that could not be checked against anything. `worker_alive` false,
+        or one job running far longer than it should be, is the whole diagnosis:
+        one worker runs one job at a time, so a job that cannot finish holds
+        every job behind it.
+        """
+        jobs = manager.all_jobs()
+        now = time.monotonic()
+        return {
+            "worker_alive": manager.worker_alive(),
+            "queued": sum(1 for job in jobs if job.status == JobStatus.QUEUED),
+            "running": sum(1 for job in jobs if job.status == JobStatus.RUNNING),
+            "jobs": [
+                {
+                    "job_id": job.id,
+                    "status": job.status.value,
+                    "correlation_id": job.correlation_id,
+                    "entrypoint": job.entrypoint,
+                    "timeout_s": job.timeout_s,
+                    "age_s": now - job.created_at,
+                    "wall_time_s": job.wall_time_s()
+                    if job.status in TERMINAL_STATUSES
+                    else (now - job.started_at if job.started_at is not None else None),
+                    "error": job.error,
+                }
+                for job in jobs
+            ],
+        }
+
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
     async def job_status(job_id: str) -> dict[str, Any]:
         """Point-in-time status; poll this or use the WS stream for live updates."""
@@ -143,6 +178,9 @@ def create_app(
             "status": job.status.value,
             "values": job.values,
             "error": job.error,
+            # The child already captures it; a caller debugging code it wrote
+            # itself has nothing else to go on but this.
+            "traceback": job.traceback,
             "files": job.files(),
             "provenance": {
                 "tool_name": tool_name,
