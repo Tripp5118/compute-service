@@ -5,7 +5,7 @@ stream is a WebSocket, and an in-process transport cannot exercise one at all.
 That is the half most worth testing here, because it is the half neither
 hand-rolled client got right.
 
-Run, from `tools/compute_interface/`:
+Run, from `compute_interface/`:
 
     PYTHONPATH="$PWD/../compute_server_base:$PWD" uv run --with fastapi --with httpx \
         --with websockets --with uvicorn --with mcp --with pyjwt --with pytest pytest tests -v

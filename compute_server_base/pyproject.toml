@@ -1,7 +1,7 @@
 [project]
 name = "compute-server-base"
-version = "0.1.0"
-description = "Shared FastAPI compute-server template for spark-lab-stack tool instances"
+version = "0.2.0"
+description = "Shared FastAPI compute-server template: run caller-supplied code on a machine with a solver installed"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
 # 3.10, not the repo's usual 3.12: the thermocalc image is pinned to

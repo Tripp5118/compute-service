@@ -5,7 +5,7 @@ though it was signed by the same dashboard, a token signed with the wrong secret
 is rejected, and the static token keeps working through the migration.
 
 Run:
-    uv run --with fastapi --with pyjwt pytest tools/compute_server_base/tests/test_auth.py -v
+    cd compute_server_base && PYTHONPATH=. uv run --with fastapi --with pyjwt --with pytest pytest tests/test_auth.py -v
 """
 
 from __future__ import annotations

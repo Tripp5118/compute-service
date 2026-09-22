@@ -1,4 +1,4 @@
-"""Shared compute-server template for spark-lab-stack tool instances.
+"""Shared compute-server template for tool-server instances.
 
 Installed into each tool image (see any tools/*/Dockerfile). An instance's
 `server/main.py` supplies a Capabilities descriptor and its own startup

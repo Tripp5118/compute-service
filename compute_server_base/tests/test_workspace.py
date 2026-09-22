@@ -5,7 +5,7 @@ writes a log, dumps and a restart, none of which can travel through a JSON
 result. These tests use plain Python jobs so they run without any toolchain.
 
 Run:
-    uv run --with fastapi --with httpx pytest tools/compute_server_base/tests -v
+    cd compute_server_base && PYTHONPATH=. uv run --with fastapi --with httpx --with pytest pytest tests -v
 """
 
 from __future__ import annotations

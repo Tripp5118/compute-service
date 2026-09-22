@@ -42,8 +42,14 @@ TC-Python. No `StrEnum`, no `match`.
 ## Tests
 
 ```bash
-uv run --with fastapi --with 'httpx' pytest tools/compute_server_base/tests -v
+cd compute_server_base
+PYTHONPATH=. uv run --with fastapi --with httpx --with pyjwt --with mcp --with pytest pytest tests -v
 ```
+
+Run them from this directory, not the repository root. A job executes in a child
+process, and that child resolves `compute_server_base` from its own path — from
+the root the parent imports fine, the child does not, and the failure surfaces
+as an empty job workspace rather than an import error.
 
 These exercise the shared path with plain-Python jobs, so they need neither
 toolchain installed.

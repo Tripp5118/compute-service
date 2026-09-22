@@ -1,21 +1,22 @@
 # compute-interface
 
-The consumer half of the compute-server protocol. Lives next to
-`compute_server_base` in this repository so that client and server change in one
-commit — the two hand-rolled clients that came before this one both drifted onto
-a deprecated endpoint because nothing tied them to the contract they spoke.
+The consumer half of the compute-server protocol. A consumer imports this rather
+than writing its own HTTP: the two hand-rolled clients that came before it both
+sat on a deprecated endpoint for months because each reimplemented the calls in
+its own project, with nothing connecting them to the contract. It releases
+alongside `compute_server_base` so both halves of the protocol change together.
 
 ## Install
 
 ```bash
-pip install ./tools/compute_interface            # REST only
-pip install './tools/compute_interface[mcp]'     # plus the MCP session helper
+pip install ./compute_interface            # REST only
+pip install './compute_interface[mcp]'     # plus the MCP session helper
 ```
 
-From another repository, by path or by git subdirectory:
+From another project, by git subdirectory:
 
 ```bash
-pip install 'compute-interface @ git+https://<host>/spark-lab-stack#subdirectory=tools/compute_interface'
+pip install 'compute-interface @ git+https://github.com/Tripp5118/compute-service@v0.2.0#subdirectory=compute_interface'
 ```
 
 ## Use

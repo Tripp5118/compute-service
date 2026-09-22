@@ -6,7 +6,7 @@ install. This drives create_app() with plain-Python jobs so the shared half
 has a check that runs anywhere.
 
 Run:
-    uv run --with fastapi --with httpx pytest tools/compute_server_base/tests -v
+    cd compute_server_base && PYTHONPATH=. uv run --with fastapi --with httpx --with pytest pytest tests -v
 """
 
 from __future__ import annotations

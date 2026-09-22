@@ -7,7 +7,7 @@ hypothetical: an empty directory left behind on `sys.path` is what a half-remove
 install looks like, and plain `import_module` accepts it.
 
 Run:
-    uv run --with fastapi pytest tools/compute_server_base/tests/test_capabilities.py -v
+    cd compute_server_base && PYTHONPATH=. uv run --with fastapi --with pytest pytest tests/test_capabilities.py -v
 """
 
 from __future__ import annotations

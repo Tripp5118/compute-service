@@ -13,7 +13,7 @@ these assertions are about what got registered, and the transport is the SDK's
 to test. One HTTP case covers the mount itself.
 
 Run:
-    uv run --with fastapi --with httpx --with mcp pytest tools/compute_server_base/tests -v
+    cd compute_server_base && PYTHONPATH=. uv run --with fastapi --with httpx --with pyjwt --with mcp --with pytest pytest tests -v
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 [project]
 name = "compute-interface"
-version = "0.1.0"
-description = "Client for spark-lab-stack compute servers — the consumer half of the protocol compute-server-base implements"
+version = "0.2.0"
+description = "Client for compute servers built on compute-server-base — the consumer half of the same protocol"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
 # Matches compute-server-base rather than the repo's usual 3.12, so the two
