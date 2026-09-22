@@ -1,4 +1,4 @@
-# compute-server-client
+# compute-interface
 
 The consumer half of the compute-server protocol. Lives next to
 `compute_server_base` in this repository so that client and server change in one
@@ -8,14 +8,14 @@ a deprecated endpoint because nothing tied them to the contract they spoke.
 ## Install
 
 ```bash
-pip install ./tools/compute_server_client            # REST only
-pip install './tools/compute_server_client[mcp]'     # plus the MCP session helper
+pip install ./tools/compute_interface            # REST only
+pip install './tools/compute_interface[mcp]'     # plus the MCP session helper
 ```
 
 From another repository, by path or by git subdirectory:
 
 ```bash
-pip install 'compute-server-client @ git+https://<host>/spark-lab-stack#subdirectory=tools/compute_server_client'
+pip install 'compute-interface @ git+https://<host>/spark-lab-stack#subdirectory=tools/compute_interface'
 ```
 
 ## Use
@@ -23,7 +23,7 @@ pip install 'compute-server-client @ git+https://<host>/spark-lab-stack#subdirec
 When you only want the numbers back:
 
 ```python
-from compute_server_client import ComputeServerClient, JobFailed, Refused
+from compute_interface import ComputeServerClient, JobFailed, Refused
 
 with ComputeServerClient("http://materials-framework:8000", token) as tool:
     values = tool.run(source, variables={"structure": cif}, timeout_s=3600)
@@ -37,7 +37,7 @@ alive, which is the first thing to read when nothing is progressing.
 The long form, when you want the live log or the files the job wrote:
 
 ```python
-from compute_server_client import ComputeServerClient, Refused
+from compute_interface import ComputeServerClient, Refused
 
 with ComputeServerClient("http://materials-framework:8000", token) as tool:
     caps = tool.capabilities()

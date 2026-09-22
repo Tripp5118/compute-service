@@ -1,5 +1,5 @@
 [project]
-name = "compute-server-client"
+name = "compute-interface"
 version = "0.1.0"
 description = "Client for spark-lab-stack compute servers — the consumer half of the protocol compute-server-base implements"
 readme = "README.md"
@@ -29,4 +29,4 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["compute_server_client"]
+packages = ["compute_interface"]

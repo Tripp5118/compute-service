@@ -5,7 +5,7 @@ stream is a WebSocket, and an in-process transport cannot exercise one at all.
 That is the half most worth testing here, because it is the half neither
 hand-rolled client got right.
 
-Run, from `tools/compute_server_client/`:
+Run, from `tools/compute_interface/`:
 
     PYTHONPATH="$PWD/../compute_server_base:$PWD" uv run --with fastapi --with httpx \
         --with websockets --with uvicorn --with mcp --with pyjwt --with pytest pytest tests -v
@@ -35,7 +35,7 @@ os.environ.setdefault("COMPUTE_SERVER_TOKEN", "test-token-for-pytest")
 
 import uvicorn  # noqa: E402 — env var must be set before the server imports
 from compute_server_base import Capabilities, Host, Operation, create_app, mount_mcp  # noqa: E402
-from compute_server_client import ComputeServerClient, ContractMismatchError, JobFailed, Refused  # noqa: E402
+from compute_interface import ComputeServerClient, ContractMismatchError, JobFailed, Refused  # noqa: E402
 
 TOKEN = os.environ["COMPUTE_SERVER_TOKEN"]
 
@@ -131,7 +131,7 @@ def test_a_contract_this_client_cannot_speak_is_refused_up_front(ready_url: str)
     """The drift this package exists to stop, caught rather than papered over."""
     with ComputeServerClient(ready_url, TOKEN) as client:
         client._check_contract = True  # noqa: SLF001 — pinning the behaviour under test
-        import compute_server_client.client as module
+        import compute_interface.client as module
 
         original = module.CONTRACT_MAJOR
         module.CONTRACT_MAJOR = "9"

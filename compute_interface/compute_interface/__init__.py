@@ -6,7 +6,7 @@ both previous hand-rolled clients ended up on a deprecated endpoint without
 anyone noticing.
 """
 
-from compute_server_client.client import (
+from compute_interface.client import (
     CONTRACT_MAJOR,
     ComputeServerClient,
     ContractMismatchError,

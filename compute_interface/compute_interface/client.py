@@ -321,7 +321,7 @@ class ComputeServerClient:
         """
         # Imported here so a consumer that never streams does not pay for it at
         # import time, and so an install without it fails at the call, not at
-        # `import compute_server_client`.
+        # `import compute_interface`.
         from websockets.sync.client import connect
 
         scheme, netloc, *_ = urlsplit(self._base)
@@ -393,7 +393,7 @@ class ComputeServerClient:
         session yielded is the SDK's, and its tools, resources and prompts are
         called directly.
 
-        Needs the `mcp` extra: `pip install compute-server-client[mcp]`.
+        Needs the `mcp` extra: `pip install compute-interface[mcp]`.
         """
         from mcp import ClientSession
         from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
