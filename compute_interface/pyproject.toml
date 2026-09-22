@@ -1,0 +1,32 @@
+[project]
+name = "compute-server-client"
+version = "0.1.0"
+description = "Client for spark-lab-stack compute servers — the consumer half of the protocol compute-server-base implements"
+readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
+# Matches compute-server-base rather than the repo's usual 3.12, so the two
+# halves of one protocol can never be blocked from living in one environment.
+requires-python = ">=3.10"
+authors = [
+    { name = "Tripp Robinson", email = "trippr5118@tamu.edu" },
+]
+dependencies = [
+    "httpx>=0.27",
+    # The live log stream. httpx does not speak WebSocket, and there is no
+    # polling fallback — /jobs/{id}/stream is the only way to read a job's
+    # output before it finishes.
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+# The MCP session helper only. Left out of the base install because a REST
+# consumer — matflow's relax node, a generated campaign — has no use for it,
+# and `mcp` pulls a server stack in with it.
+mcp = ["mcp>=2.0,<3"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["compute_server_client"]
