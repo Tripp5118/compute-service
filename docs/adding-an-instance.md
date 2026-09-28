@@ -1,8 +1,7 @@
 # Adding a brand-new tool server
 
-Moved here from `spark-dashboard/AGENTS.md` on 2026-09-23, when the tool servers
-were split into their own repositories. Building an instance is this repository's
-subject; registering and credentialling one is still the dashboard's.
+Building an instance is this repository's subject; registering and credentialling
+one is the dashboard's.
 
 `docs/execution-servers.md` says what a server has to do and why before you decide
 how yours does it. `spark-tool-lammps` is the worked example — read it alongside

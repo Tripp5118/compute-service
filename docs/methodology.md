@@ -4,10 +4,8 @@ The architectural decisions behind `compute_server_base` and `compute_interface`
 the two halves of one protocol. Changing any of these changes what every tool
 server and every consumer can rely on.
 
-Moved here from `spark-dashboard/docs/methodology_map.md` on 2026-09-23, when the
-tool servers were split into their own repositories. The dashboard keeps the
-decisions about how *it* credentials and probes a tool server; the decisions about
-what a tool server is and what it promises are here.
+The dashboard keeps the decisions about how *it* credentials and probes a tool
+server; the decisions about what a tool server is and what it promises are here.
 
 ---
 

@@ -26,7 +26,7 @@ dependencies = [
 # hatchling, not the repo's usual uv_build: uv_build is a Rust binary, and the
 # thermocalc image builds under qemu-user emulation, where it dies with the
 # "QEMU internal SIGSEGV" this repo has already hit elsewhere. A pure-Python
-# backend has no such problem. Measured 2026-08-12.
+# backend has no such problem.
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

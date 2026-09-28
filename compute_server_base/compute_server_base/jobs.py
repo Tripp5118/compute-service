@@ -21,13 +21,13 @@ an accepted tradeoff for a LAN-only service shared between trusted
 first-party backends (MatFlow, [other project]) — not a public API.
 
 Each job runs in a child process (`_job_runner.py`), in its own session, and
-`timeout_s` and `cancel` kill that session's process group. Until 2026-09-04
-execution lived in a thread pool thread instead, which meant neither could stop
-anything: a thread cannot be interrupted, so a timed-out job was marked failed
-and went on computing until the container was restarted. One did, for 19 hours,
-holding 19 cores and 44 GB. The process group rather than the process alone
-because job code may spawn its own subprocesses — LAMMPS jobs run `lmp` under
-`Popen`, and killing only the Python child would orphan the solver.
+`timeout_s` and `cancel` kill that session's process group. Not a thread pool
+thread: a thread cannot be interrupted, so neither could stop anything — a
+timed-out job would be marked failed and go on computing until the container was
+restarted. One did, for 19 hours, holding 19 cores and 44 GB. The process group
+rather than the process alone because job code may spawn its own subprocesses —
+LAMMPS jobs run `lmp` under `Popen`, and killing only the Python child would
+orphan the solver.
 """
 
 from __future__ import annotations

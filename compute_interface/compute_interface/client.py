@@ -44,9 +44,8 @@ __all__ = ["ComputeServerClient", "ContractMismatchError", "JobFailed", "Refusal
 # servers' PROTOCOL.md files already tell integrators to refuse a major they
 # do not understand, and this is that instruction as code.
 #
-# "0", because that is what the servers actually report — materials-framework
-# 0.4, lammps 0.1, thermocalc 0.1 (measured against the live instances
-# 2026-08-26; a stub fixture saying "1.0" is what hid it). The number is
+# "0", because that is what the live servers report. Check it against them, not
+# against a stub fixture — one saying "1.0" is what hid this. The number is
 # per-instance rather than per-contract today, so a major check is all it can
 # usefully carry: under 0.x a minor bump may break, and this check would not
 # see it. Tighten it when the instances reach 1.0 and agree.
