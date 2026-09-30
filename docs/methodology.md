@@ -57,6 +57,21 @@ and the client checks its major component on the first `capabilities()` call. A
 consumer pinned to an older package finds out there, rather than from a route that
 starts returning 404 a month later.
 
+Three versions, because they skew independently and a single field cannot carry
+all three. `contract_version` is the protocol. `version` is the solver's —
+materialsframework's, LAMMPS's, TC-Python's — and tracks upstream. `source_ref`
+is the instance repo's commit, stamped at build time from a `SOURCE_REF` build
+argument, null when the build supplied none.
+
+`source_ref` exists because the other two cannot answer the question a consumer
+actually has. An agent that operates a tool is built from the `agent.md` and
+knowledge files in that tool's repo, fetched at some commit. Rebuild the image
+from newer source — a new operation, a rewritten instruction — and
+`contract_version` does not move, because the protocol did not change, and
+`version` does not move, because the solver did not. Only `source_ref` does. It
+is what lets a consumer notice that the agent it built is older than the server
+it is talking to.
+
 It holds no cost model, no scheduling, no retry policy and no opinion about which
 calculation is worth running — the same split every other decision here holds.
 

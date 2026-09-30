@@ -18,6 +18,7 @@ See docs/infra-cleanup-2026-08.md S-2.
 from __future__ import annotations
 
 import importlib
+import os
 import platform
 from pathlib import Path
 from typing import Any
@@ -61,6 +62,9 @@ class Capabilities(BaseModel):
     """A compute server's identity, health, and invocable operations."""
 
     tool: str
+    # The solver's version — materialsframework's, LAMMPS's, TC-Python's. It
+    # tracks upstream and does not move when this repo changes, which is why
+    # source_ref exists separately.
     version: str
     # Carried over from the /manifest it replaces: each PROTOCOL.md tells
     # integrators to refuse a major version they don't understand, and dropping
@@ -69,6 +73,16 @@ class Capabilities(BaseModel):
     ready: bool
     host: Host
     operations: list[Operation] = Field(default_factory=list)
+    # The instance repo's commit this image was built from, or None when the
+    # build did not supply one.
+    #
+    # A consumer fetches a tool's agent.md and knowledge files from that repo at
+    # a known commit, then builds an agent from them. The only way it can tell
+    # that the server has since been rebuilt from newer source — new operation,
+    # rewritten instructions — is if the server says which commit it came from.
+    # `version` cannot answer that: it reports the upstream solver, so editing
+    # this repo and rebuilding leaves it unchanged.
+    source_ref: str | None = Field(default_factory=lambda: os.environ.get("SOURCE_REF") or None)
 
 
 def under_emulation() -> bool:
