@@ -3,9 +3,8 @@
 An agent that gets a traceback cannot tell "this machine cannot do this, and
 here is why" from "this broke". Those call for different next actions: the
 first means pick a different instance or a different calculation, the second
-means retry or report a bug. So a refusal travels as data on both faces — the
-same JSON body whether it came back from an MCP tool call or from an HTTP
-route (`docs/execution-servers.md`, missing item 3).
+means retry or report a bug. A refusal therefore travels as structured JSON
+from an HTTP route.
 
 `reason` is drawn from a closed set, because the point is that a caller can
 branch on it. Every value in that set is something this server can check by
@@ -41,11 +40,10 @@ class RefusalReason(str, Enum):  # noqa: UP042 — StrEnum needs 3.11; thermocal
 
 
 class Refusal(BaseModel):
-    """The body a refusal travels in, identical over MCP and over HTTP."""
+    """The body a refusal travels in from an HTTP route."""
 
-    # Present and always true so a caller can test one key without first
-    # knowing which of the two faces the response arrived on, and without
-    # having to distinguish a refusal from a job that ran and failed.
+    # Present and always true so a caller can distinguish a refusal from a job
+    # that ran and failed.
     refused: bool = True
     reason: RefusalReason
     detail: str
@@ -57,7 +55,7 @@ class Refusal(BaseModel):
 
 
 class Refused(Exception):  # noqa: N818 — it is a refusal, not an error; the name is the point
-    """Raised inside an HTTP route; the handler turns it into the same body MCP returns."""
+    """Raised inside an HTTP route; the handler returns its body as a 422."""
 
     def __init__(self, refusal: Refusal) -> None:
         """Carry the body so the handler has nothing to reconstruct."""
@@ -66,7 +64,7 @@ class Refused(Exception):  # noqa: N818 — it is a refusal, not an error; the n
 
 
 def refusal(reason: RefusalReason, detail: str, **context: Any) -> dict[str, Any]:
-    """Build the refusal body an MCP tool returns.
+    """Build the refusal body returned by an HTTP route.
 
     Args:
         reason: Which of the closed set applies.
@@ -83,5 +81,5 @@ def refuse(reason: RefusalReason, detail: str, **context: Any) -> Refused:
 
 
 def not_ready_detail(tool_name: str) -> str:
-    """One wording for the commonest refusal, so the two faces cannot drift apart."""
+    """One wording for the commonest refusal, so callers receive a stable answer."""
     return f"{tool_name} is not ready to run jobs on this host — code submitted now would fail on import"

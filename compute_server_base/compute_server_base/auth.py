@@ -118,10 +118,10 @@ def require_token(authorization: str = Header(default="")) -> str:
 
 
 def check_ws_token(token: str) -> bool:
-    """Validate a bare token from a WebSocket connection or a mounted sub-app.
+    """Validate a bare token from a WebSocket connection.
 
-    WebSocket handshakes can't use the Header dependency, and the MCP mount is
-    plain ASGI in front of a session manager, so both check the token explicitly.
+    WebSocket handshakes cannot use the Header dependency, so they check the
+    token explicitly.
 
     Args:
         token: Raw token string, without the "Bearer " prefix.

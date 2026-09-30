@@ -8,7 +8,7 @@ hand-rolled client got right.
 Run, from `compute_interface/`:
 
     PYTHONPATH="$PWD/../compute_server_base:$PWD" uv run --with fastapi --with httpx \
-        --with websockets --with uvicorn --with mcp --with pyjwt --with pytest pytest tests -v
+        --with websockets --with uvicorn --with pyjwt --with pytest pytest tests -v
 
 PYTHONPATH rather than `--with ../compute_server_base`: uv serves a cached build
 of that package keyed on its version, so an un-bumped edit to the server half is
@@ -18,7 +18,6 @@ the client/server disagreements that would hide behind that.
 
 from __future__ import annotations
 
-import asyncio
 import os
 import socket
 import threading
@@ -34,7 +33,7 @@ if TYPE_CHECKING:
 os.environ.setdefault("COMPUTE_SERVER_TOKEN", "test-token-for-pytest")
 
 import uvicorn  # noqa: E402 — env var must be set before the server imports
-from compute_server_base import Capabilities, Host, Operation, create_app, mount_mcp  # noqa: E402
+from compute_server_base import Capabilities, Host, Operation, create_app  # noqa: E402
 from compute_interface import ComputeServerClient, ContractMismatchError, JobFailed, Refused  # noqa: E402
 
 TOKEN = os.environ["COMPUTE_SERVER_TOKEN"]
@@ -68,21 +67,12 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _serve(capabilities: Any, workspace: Path, *, with_mcp: bool = False) -> Iterator[str]:
+def _serve(capabilities: Any, workspace: Path) -> Iterator[str]:
     """Run one compute server on a loopback port for the life of a test."""
     os.environ["JOB_WORKSPACE_ROOT"] = str(workspace)
     port = _free_port()
 
-    def _mount(app: Any) -> Any:
-        return mount_mcp(
-            app,
-            tool_name="stub",
-            capabilities=capabilities(),
-            manager=app.state.jobs,
-            job_builders={},
-        )
-
-    app = create_app(tool_name="stub", capabilities=capabilities, mcp_mount=_mount if with_mcp else None)
+    app = create_app(tool_name="stub", capabilities=capabilities)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -107,12 +97,6 @@ def ready_url(tmp_path: Path) -> Iterator[str]:
 def not_ready_url(tmp_path: Path) -> Iterator[str]:
     """A server whose compute is absent — thermocalc with no engine bind-mounted."""
     yield from _serve(_not_ready, tmp_path / "not-ready")
-
-
-@pytest.fixture
-def mcp_url(tmp_path: Path) -> Iterator[str]:
-    """A server with the MCP mount protected by the same bearer token."""
-    yield from _serve(_capabilities, tmp_path / "mcp", with_mcp=True)
 
 
 def test_capabilities_comes_back_whole(ready_url: str) -> None:
@@ -243,21 +227,3 @@ def test_a_refusal_is_not_a_transport_error(not_ready_url: str) -> None:
     import httpx
 
     assert not isinstance(caught.value, httpx.HTTPError)
-
-
-def test_the_mcp_mount_and_credential_are_derived_not_reconstructed(ready_url: str) -> None:
-    """The two things a hand-rolled MCP attachment gets wrong: the slash and the header."""
-    with ComputeServerClient(ready_url, TOKEN) as client:
-        assert client.mcp_url == f"{ready_url}/mcp/"
-        assert client.auth_headers == {"Authorization": f"Bearer {TOKEN}"}
-
-
-def test_mcp_session_initializes_over_the_authenticated_transport(mcp_url: str) -> None:
-    """The MCP helper supplies bearer auth through the SDK's HTTP client."""
-    async def list_tools() -> list[str]:
-        with ComputeServerClient(mcp_url, TOKEN) as client:
-            async with client.mcp_session() as session:
-                result = await session.list_tools()
-        return [tool.name for tool in result.tools]
-
-    assert {"submit_code", "get_capabilities"} <= set(asyncio.run(list_tools()))

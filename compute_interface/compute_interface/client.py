@@ -370,39 +370,6 @@ class ComputeServerClient:
         """Delete the workspace. Nothing else reclaims it — no sweeper runs."""
         self._json(self._client.delete(f"/jobs/{job_id}/files"))
 
-    # ---- the other face ---------------------------------------------------------
-
-    @property
-    def mcp_url(self) -> str:
-        """The MCP mount, for a client that would rather build its own session."""
-        return f"{self._base}/mcp/"
-
-    @property
-    def auth_headers(self) -> dict[str, str]:
-        """The bearer header. One credential covers both faces."""
-        return {"Authorization": f"Bearer {self._token}"}
-
-    @contextlib.asynccontextmanager
-    async def mcp_session(self) -> Any:
-        """An initialized MCP session against this same server and token.
-
-        Exists because the two things easy to get wrong here are the trailing
-        slash on `/mcp/` and the bearer header, and both belong with the object
-        that already knows the URL and the token. It wraps nothing else — the
-        session yielded is the SDK's, and its tools, resources and prompts are
-        called directly.
-
-        Needs the `mcp` extra: `pip install compute-interface[mcp]`.
-        """
-        from mcp import ClientSession
-        from mcp.client.streamable_http import create_mcp_http_client, streamable_http_client
-
-        async with create_mcp_http_client(headers=self.auth_headers) as http_client:
-            async with streamable_http_client(self.mcp_url, http_client=http_client) as (read, write):
-                async with ClientSession(read, write) as session:
-                    await session.initialize()
-                    yield session
-
     # ---- plumbing ---------------------------------------------------------------
 
     def close(self) -> None:

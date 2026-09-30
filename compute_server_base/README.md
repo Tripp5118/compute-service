@@ -43,7 +43,7 @@ TC-Python. No `StrEnum`, no `match`.
 
 ```bash
 cd compute_server_base
-PYTHONPATH=. uv run --with fastapi --with httpx --with pyjwt --with mcp --with pytest pytest tests -v
+PYTHONPATH=. uv run --with fastapi --with httpx --with pyjwt --with pytest pytest tests -v
 ```
 
 Run them from this directory, not the repository root. A job executes in a child

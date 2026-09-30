@@ -52,7 +52,6 @@ def create_app(
     tool_name: str,
     capabilities: Callable[[], Capabilities],
     on_startup: Callable[[], None] | None = None,
-    mcp_mount: Callable[[FastAPI], Any] | None = None,
 ) -> FastAPI:
     """Build an instance's FastAPI app with the shared routes mounted.
 
@@ -64,10 +63,6 @@ def create_app(
         on_startup: Instance-specific startup probing, run after the job worker
             starts. Raising here aborts startup; log instead if the server
             should come up degraded and report it through `capabilities`.
-        mcp_mount: Called with the finished app to mount an MCP facade, and
-            returning the MCPServer. Taken as a callback rather than a value
-            because the facade needs the built app while the app's lifespan
-            needs the facade's session manager — this is what unties that knot.
 
     Returns:
         The app, with `app.state.jobs` holding the JobManager.
@@ -78,20 +73,13 @@ def create_app(
     set_audience(tool_name)
 
     manager = JobManager()
-    # Assigned below, after the app exists; the lifespan closure reads it at
-    # startup, by which point mcp_mount has run.
-    mcp_server: list[Any] = []
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         manager.start()
         if on_startup is not None:
             on_startup()
-        if mcp_server:
-            async with mcp_server[0].session_manager.run():
-                yield
-        else:
-            yield
+        yield
 
     app = FastAPI(title=f"{tool_name} compute server", docs_url=None, redoc_url=None, lifespan=_lifespan)
     app.state.jobs = manager
@@ -295,8 +283,5 @@ def create_app(
             job.unsubscribe(queue)
             with contextlib.suppress(Exception):
                 await websocket.close()
-
-    if mcp_mount is not None:
-        mcp_server.append(mcp_mount(app))
 
     return app

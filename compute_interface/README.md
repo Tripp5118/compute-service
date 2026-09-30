@@ -9,14 +9,13 @@ alongside `compute_server_base` so both halves of the protocol change together.
 ## Install
 
 ```bash
-pip install ./compute_interface            # REST only
-pip install './compute_interface[mcp]'     # plus the MCP session helper
+pip install ./compute_interface
 ```
 
 From another project, by git subdirectory:
 
 ```bash
-pip install 'compute-interface @ git+https://github.com/Tripp5118/compute-service@v0.2.0#subdirectory=compute_interface'
+pip install 'compute-interface @ git+https://github.com/Tripp5118/compute-service@v0.4.0#subdirectory=compute_interface'
 ```
 
 ## Use

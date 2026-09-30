@@ -1,6 +1,6 @@
 [project]
 name = "compute-interface"
-version = "0.2.0"
+version = "0.4.0"
 description = "Client for compute servers built on compute-server-base — the consumer half of the same protocol"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
@@ -18,11 +18,6 @@ dependencies = [
     "websockets>=13",
 ]
 
-[project.optional-dependencies]
-# The MCP session helper only. Left out of the base install because a REST
-# consumer — matflow's relax node, a generated campaign — has no use for it,
-# and `mcp` pulls a server stack in with it.
-mcp = ["mcp>=2.0,<3"]
 
 [build-system]
 requires = ["hatchling"]

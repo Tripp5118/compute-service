@@ -33,23 +33,20 @@ took, on what host, under what conditions. It does not hold a cost model, a budg
 schedule, or an opinion about which calculation is worth doing. Those belong to the
 client.
 
-## Two faces on one process
+## One REST contract
 
-One process, one job queue, one credential. `compute_server_base/app.py` serves REST;
-`compute_server_base/mcp_facade.py` mounts MCP at `/mcp` on the same app behind the
-same bearer check.
+One process, one job queue, one credential, one REST API. `compute_server_base/app.py`
+serves the execution contract behind its bearer check.
 
-**REST is for execution.** A running calculation makes many calls and should not carry
-an MCP client to do it. `matflow`'s relax node and the `campaign.py` autoBO's agent
-writes are both REST callers.
+A provider executes jobs and reports facts only: its live capabilities, readiness, job
+state, results and files. It does not teach an agent how to operate the tool. Tool
+instructions live in the private repository beside the container source — `agent.md`
+and the knowledge files it names — where a consumer fetches them at a known commit and
+builds its tool-use agent on the client side.
 
-**MCP is for finding out what the server can do and for an agent to drive it.** An
-agent attaches, reads the operations and the knowledge pack, submits work, polls, reads
-files. This is where a tool's own documentation belongs, because it versions with the
-image that implements it.
-
-The split is temporal, not a preference: nothing reaches into a calculation while the
-calculation is running.
+That split keeps a wrong instruction fixable by a repository commit rather than an image
+rebuild, and keeps the server limited to facts it alone can establish: what imports,
+what is ready, and what a job did.
 
 ## What every instance must expose
 
@@ -73,31 +70,17 @@ calculation is running.
 Every job runs in its own directory with the process cwd set to it, so code that names
 its output files relatively writes them where they can be fetched from.
 
-### Discovery and agent use, over MCP at `/mcp`
-
-| Requirement | Why |
-|---|---|
-| Submit arbitrary code | Same reason as `POST /jobs`. An agent that can only call named operations cannot write its own calculation. |
-| One submit tool per advertised operation | The convenience path. Generated from `Capabilities` after the backend probe, so it cannot advertise something the image cannot run. |
-| Read the capability descriptor | An agent has to be able to see the host facts and the version, not just the tool list generated from them. Emulation and architecture mismatch change whether a number is trustworthy. |
-| Poll, read result, cancel | The async pattern. An MCP call is request/response and a calculation outlives one. |
-| List and read files from the workspace | For tools whose real output is files. Bulk retrieval stays on HTTP. |
-| The knowledge pack as resources, with keyword lookup | The tool's own documentation, shipped in the image so it versions with the code it describes. |
-| Refuse in a form an agent can act on | "This instance cannot run this" is a normal response. A traceback is not. |
-
 ## What each instance has today
 
 All three inherit the full REST surface above from `create_app()`, including the
-workspace, the file routes and the WebSocket stream. That half is identical
-everywhere. They also all inherit `submit_code`, `get_capabilities` and the refusal
-shape, so the MCP column below means "has a facade mounted", not "has only the named
-operations".
+workspace, file routes and WebSocket stream. Their source repositories hold any
+agent-facing knowledge; no running instance serves it.
 
-| | Operations | Knowledge docs | `/capabilities` | `/mcp` | Deprecated shims |
-|---|---|---|---|---|---|
-| materials-framework | 18 | 26 | yes | yes | `/manifest`, `/mlips` still served |
-| lammps | 2 — `run_input_script`, `check_input_script` | 9 | yes | yes | none, and never had them |
-| thermocalc | 1 — `run_tc_python` | 3 | yes | yes | `/manifest` still served |
+| | Operations | `/capabilities` | Deprecated shims |
+|---|---|---|---|
+| materials-framework | 18 | yes | `/manifest`, `/mlips` still served |
+| lammps | 2 — `run_input_script`, `check_input_script` | yes | none, and never had them |
+| thermocalc | 1 — `run_tc_python` | yes | `/manifest` still served |
 
 Job shape differs by instance and that is deliberate. materials-framework and
 thermocalc take Python source. LAMMPS takes an input script, because a LAMMPS caller

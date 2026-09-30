@@ -16,8 +16,6 @@ from compute_server_base.capabilities import (
     under_emulation,
 )
 from compute_server_base.jobs import TERMINAL_STATUSES, JobManager, JobStatus
-from compute_server_base.knowledge import KnowledgeDoc, load_knowledge, reconcile, search
-from compute_server_base.mcp_facade import mount_mcp
 from compute_server_base.refusal import Refusal, RefusalReason, Refused, not_ready_detail, refusal, refuse
 
 __all__ = [
@@ -27,7 +25,6 @@ __all__ = [
     "JobManager",
     "JobRequest",
     "JobStatus",
-    "KnowledgeDoc",
     "Operation",
     "Refusal",
     "RefusalReason",
@@ -35,14 +32,10 @@ __all__ = [
     "available_backends",
     "check_ws_token",
     "create_app",
-    "load_knowledge",
-    "mount_mcp",
     "not_ready_detail",
     "probe_import",
-    "reconcile",
     "refusal",
     "refuse",
     "require_token",
-    "search",
     "under_emulation",
 ]

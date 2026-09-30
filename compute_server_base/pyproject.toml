@@ -1,6 +1,6 @@
 [project]
 name = "compute-server-base"
-version = "0.2.0"
+version = "0.4.0"
 description = "Shared FastAPI compute-server template: run caller-supplied code on a machine with a solver installed"
 readme = "README.md"
 license = { text = "GPL-3.0-or-later" }
@@ -14,10 +14,6 @@ authors = [
 dependencies = [
     "fastapi>=0.115",
     "pydantic>=2.9",
-    # The MCP facade (S-2b). Pinned to the 2.x line because 2.0 renamed the
-    # server class FastMCP -> MCPServer and the client entry point to
-    # streamable_http_client; 1.x will not import this package's code.
-    "mcp>=2.0,<3",
     # Verifying dashboard-issued job tokens (S-4). Same library the dashboard
     # signs them with, so the two sides cannot disagree about HS256 or claims.
     "pyjwt>=2.9",

@@ -77,12 +77,11 @@ calculation is worth running — the same split every other decision here holds.
 
 ## Refusal is a value with a closed reason set, and the set holds no judgments
 
-"This instance will not run that" travels as data on both faces: a `Refusal` body
-(`refused`, `reason`, `detail`, `context`) returned by MCP tools and raised by HTTP
-routes, which `create_app()`'s handler turns into the identical body as a 422. An
-agent that gets a traceback cannot tell "this machine cannot do this, and here is
-why" from "this broke", and those call for different next actions — pick another
-instance, versus retry or report a bug.
+"This instance will not run that" travels as data as a `Refusal` body
+(`refused`, `reason`, `detail`, `context`) from an HTTP route, which
+`create_app()` turns into a 422. An agent that gets a traceback cannot tell "this
+machine cannot do this, and here is why" from "this broke", and those call for
+different next actions — pick another instance, versus retry or report a bug.
 
 `reason` is a closed set precisely so a caller can branch on it, and every value in
 it is something the server establishes **by looking**: the instance is not ready, the
@@ -97,42 +96,23 @@ holds: the instrument reports, the client decides. Preconditions live in each to
 knowledge pack, where an agent reads them and decides for itself. Adding a reason
 that requires a judgment is a methodology change, not a new enum value.
 
-## Tool knowledge lives in the image, served over MCP alongside REST
+## Tool knowledge lives in the repository, read by the consumer
 
-A tool's domain knowledge — which workflows it supports, their preconditions,
-valid orderings, refusal conditions, how to read a result — ships as a markdown
-pack **inside the tool image** (each tool repository's `knowledge/`), because it
-describes what that build can do and therefore has to version with it. The
-rejected alternative was keeping it in each consuming project, where it drifts
-from the installed reality and every consumer needs its own copy.
+A tool's domain knowledge — workflows, preconditions, valid orderings, refusal
+conditions and how to read a result — lives as `agent.md` and the knowledge files
+it names at the root of that tool's private repository. A consumer fetches those
+files at a known commit, filters the documents against live `/capabilities`, and
+builds its tool-use agent locally.
 
-Agents reach it through an MCP endpoint mounted on the same FastAPI app, in the
-same process, behind the same bearer token — no second service, no second
-credential path. MCP tools are the advertised operations in async form (`submit_*`
-returns a job id; `get_job`/`get_result`/`cancel_job` read it, nothing blocks);
-resources are the pack; prompts are its `prompts/` documents.
+The provider never serves that prose. Its job is to execute and report facts;
+the consumer owns retrieval, prompt assembly and the decision about what to do
+next. A document's `requires_operation` and `requires_backends` fields still
+matter, but filtering happens client-side against the live descriptor rather
+than once inside a container.
 
-**The pack is reconciled against the live descriptor at startup.** A document
-whose `requires_operation` has no importable backend is not served at all. That
-is what lets a consumer trust an advertisement flatly rather than holding a
-precedence rule between a document and an endpoint — the same principle as
-operations-keyed capability, applied to prose.
-
-Three constraints hold this split in place:
-
-1. **MCP is additive; REST stays.** MatFlow's relax node and autoBO's generated
-   `campaign.py` are REST consumers, and a scalar evaluation loop making
-   thousands of calls should not carry an MCP client. MCP is for planning and
-   selection, REST for execution.
-2. **Jobs stay asynchronous.** An MCP tool call is request/response and a relax
-   outlives one request, so the existing queue, cancel and log-stream machinery
-   is untouched underneath.
-3. **Planning stays in the agent.** A tool server that makes experimental
-   decisions is the wrong split. `search_workflows` is a lookup, not a decision.
-
-Because the pack's prose is what a language model actually reads, its writing
-quality is part of the API surface, which is the other reason it lives in the
-tool's own repository rather than being paraphrased downstream.
+Because the prose is what a language model reads, its writing quality is part of
+the tool's source interface. Keeping it in the repository makes it reviewable
+and correctable without rebuilding a running image.
 
 Instances still choose their own base image and platform — thermocalc is
 pinned to `linux/amd64` and Python 3.10 for TC-Python, materials-framework is
