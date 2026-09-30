@@ -9,28 +9,48 @@ server; the decisions about what a tool server is and what it promises are here.
 
 ---
 
-## Compute-server template: one shared base, one capability contract
+## The API is CRUD for jobs, and never a wrapper around the tool
 
 A tool server is an instance of a template, not an independent service.
 Everything generic — the job queue, bearer auth, and every shared route — lives
-in `compute_server_base/`, installed into each image. An instance's
-`server/main.py` contributes exactly two things: a `Capabilities` descriptor and
-its own startup probing. This was extracted once the second instance's `jobs.py`
-was byte-identical to the first's and a third (LAMMPS) was foreseeable.
+in `compute_server_base/`, installed into each image. This was extracted once
+the second instance's `jobs.py` was byte-identical to the first's and a third
+(LAMMPS) was foreseeable.
 
-`GET /capabilities` is the contract every consumer reads — autoBO's tool
-agents, MatFlow's node catalog, the dashboard's tools page. It is keyed on
-**operations**, not calculators or models: a backend is advertised under each
-operation it can actually serve and nowhere else. Capability is genuinely
-non-uniform — MEGNet predicts formation energy and has no `.relax()` at all —
-so a contract keyed on "calculator" pushes that special case into every
-consumer, as matflow `67a418c` shows. Backends are filtered by live import
-probe per request, so an advertisement can be trusted flatly rather than
-weighed against a separate document.
+**The API takes jobs and reports what happened to them.** Python source, an
+entrypoint, its arguments. Queue it, run it, return values, files, logs, status.
+What the code does with the installed library is the code's business.
 
-The predecessors `/manifest` and `/mlips` survive as deprecated shims because
-MatFlow's relax node calls `/mlips` and that project is paused. They go once
-its client is repointed.
+The API describes nothing about the tool it hosts, and this is the decision the
+design keeps drifting away from. An endpoint per tool call — `submit_relax`,
+`POST /operations/relax` — encodes that library's current call signature into the
+server. Upstream renames an argument and the *server* is wrong, and has to be
+rebuilt and redeployed to say the same thing differently. Arbitrary code has no
+such coupling: when the library changes, the job code changes, and the job code
+is written by the consumer already reading that library's documentation.
+
+A capability descriptor listing operations with their `inputs` and `returns` is
+the same mistake one level removed. It is a call-shape contract even when nothing
+dispatches on it, and every consumer that reads one and every document that
+explains one grows toward calling those operations. `GET /capabilities` is gone
+for that reason, along with `Capabilities`, `Host` and `Operation`.
+
+What a tool can compute is answered by `agent.md` and the knowledge files beside
+it in that tool's repository, fetched by the consumer at a release tag. A running
+container answers what a *job* did, never what the *tool* can do.
+
+An instance may still add a route for its own **input format**, which is not the
+same thing as a call into its library: `POST /run` on LAMMPS takes an input
+script, because a script is LAMMPS's native input rather than a function
+signature upstream can rename.
+
+The deprecated `/manifest` and `/mlips` shims go with `/capabilities`. They were
+kept on the belief that matflow's relax node called `/mlips`. It does not: every
+`mlips` mention in matflow is a docstring, a comment, a UI tooltip or a test
+name, its MLIP list is a hardcoded dict (`materials_framework_relax.py:31-34`),
+and its `manifest()` client method has no callers. What matflow actually calls is
+`POST /jobs`, the job stream, `GET /jobs/{id}/result` and
+`POST /jobs/{id}/cancel` — job CRUD, so it is unaffected by any of this.
 
 ## One client package, shipped with the server it calls
 
@@ -47,33 +67,34 @@ reimplemented the HTTP calls in its own project, where nothing connected them to
 the contract. A consumer that reimplements them again is outside every guarantee
 below, whatever repository it lives in.
 
-The client **defines no copy of anything the server owns.** `capabilities()` returns
-the parsed descriptor as a dict rather than a re-declared `Capabilities`, and a
-refusal's `reason` stays a string rather than a copied enum. A second model of the
-same shape is the drift in miniature, so there is not one.
-
-Version skew is reported, not silent. `Capabilities` carries a `contract_version`,
-and the client checks its major component on the first `capabilities()` call. A
-consumer pinned to an older package finds out there, rather than from a route that
-starts returning 404 a month later.
-
-Three versions, because they skew independently and a single field cannot carry
-all three. `contract_version` is the protocol. `version` is the solver's —
-materialsframework's, LAMMPS's, TC-Python's — and tracks upstream. `source_ref`
-is the instance repo's commit, stamped at build time from a `SOURCE_REF` build
-argument, null when the build supplied none.
-
-`source_ref` exists because the other two cannot answer the question a consumer
-actually has. An agent that operates a tool is built from the `agent.md` and
-knowledge files in that tool's repo, fetched at some commit. Rebuild the image
-from newer source — a new operation, a rewritten instruction — and
-`contract_version` does not move, because the protocol did not change, and
-`version` does not move, because the solver did not. Only `source_ref` does. It
-is what lets a consumer notice that the agent it built is older than the server
-it is talking to.
+The client **defines no copy of anything the server owns.** A refusal's `reason`
+stays a string rather than a copied enum. A second model of the same shape is the
+drift in miniature, so there is not one.
 
 It holds no cost model, no scheduling, no retry policy and no opinion about which
 calculation is worth running — the same split every other decision here holds.
+
+## One version, declared by the consumer on every job
+
+There is one version on the wire: **the tool repository's release tag.** The image
+is built from it, and `agent.md` and the knowledge base come from it. One tag, one
+meaning.
+
+There were three, and that was two too many. `contract_version` was the protocol,
+`version` was the solver's, `source_ref` was the instance repo's build commit;
+each skewed independently, all three were read off a descriptor that no longer
+exists, and none of them answered the question a consumer actually has.
+
+The question is: *is the agent I built still right about this server?* So the
+consumer answers it rather than polling for it. It fetches `agent.md` and the KB
+at a tag, builds its tool-use agent, and sends that tag with every job. If it does
+not match what the server was built from, the server refuses the job and says the
+definition is stale. Cut a release whenever a change would make an agent's
+instructions wrong, and drift surfaces at the moment of use instead of never.
+
+The solver's own version is a fact about the image, documented in that
+repository's `agent.md`. It is not on the wire, because nothing on the wire
+should depend on it.
 
 ## Refusal is a value with a closed reason set, and the set holds no judgments
 
@@ -150,32 +171,35 @@ code — but because the *caller* must not be able to read the host through it.
 
 ## Key Invariants
 
-1. The `Capabilities` shape in `compute_server_base/compute_server_base/capabilities.py`
-   is the contract between every tool server and every consumer of one — changes to
-   it are methodology changes. It stays operations-keyed, and `compute_server_base/`
-   stays Python 3.10-compatible while any instance image is.
+1. The API is CRUD for jobs. It never grows a route, a field or a descriptor that
+   names a call into the hosted tool — no per-operation endpoint, no operations
+   list, no `inputs`/`returns` call shapes. Adding one is a methodology change, and
+   the reason to refuse it is that it couples this server to a library signature
+   upstream can rename. A route for an instance's own *input format*, like LAMMPS's
+   `POST /run`, is not that. `compute_server_base/` stays Python 3.10-compatible
+   while any instance image is.
 2. A tool server never consults the dashboard to authenticate a caller. Verification
    is a local signature check plus an audience check, so compute keeps working when
    the dashboard is down — adding a network call or a synced allowlist to that path
    is a methodology change.
-3. Nothing a tool server advertises may outrun what its image can do. Operations are
-   filtered by live import probe, and a knowledge document is served only if the
-   operation it requires is advertised. Adding an advertisement path that skips that
-   check — an operation listed from a static table, a document served unreconciled —
-   is a methodology change, because every consumer's right to trust the advertisement
-   flatly depends on it.
-4. The MCP face carries the same two general powers the REST face does: an agent can
-   submit code it wrote itself (`submit_code`, mirroring `POST /jobs`) and can read the
-   capability descriptor (`get_capabilities`). Named `submit_<operation>` tools are a
-   convenience over the same execution path, never a replacement for it — a face that
-   only offers named operations cannot serve the use case these servers exist for.
+3. A tool server advertises nothing about its tool. It does not say what the tool
+   can compute, which backends are installed, or what a call into it looks like.
+   That question is answered by `agent.md` and its knowledge base in the tool's
+   repository, and a job either imports what it needs or fails saying so.
+4. Arbitrary Python from a trusted consumer is the interface, not an escape hatch
+   beside a menu of named operations. A server that only runs things it has names
+   for cannot do the work these exist for, and every such name is a signature that
+   can go stale.
 5. A refusal's `reason` vocabulary is closed, and every value in it is mechanically
    checkable by the server. Adding one that requires a judgment about whether a
    calculation is sensible is a methodology change, because it moves experimental
    decisions into the instrument.
 6. A consumer reaches a compute server through `compute_interface`, not through HTTP
-   it writes itself. The package defines no second copy of a shape the server owns,
-   ships from this repository so both halves release together, and reports a major
-   `contract_version` mismatch rather than failing quietly later. Reimplementing the
-   calls in a consuming project is how `/manifest` outlived its deprecation in two
-   projects at once, and it forfeits every guarantee in this list.
+   it writes itself. The package defines no second copy of a shape the server owns
+   and ships from this repository so both halves release together. Reimplementing
+   the calls in a consuming project is how `/manifest` outlived its deprecation in
+   two projects at once, and it forfeits every guarantee in this list.
+7. A consumer declares the release tag it built its agent from on every job, and a
+   server that was built from a different one refuses the job rather than running
+   it. Work done under instructions already known to be stale is worse than work
+   not done, because nothing downstream can tell the difference.

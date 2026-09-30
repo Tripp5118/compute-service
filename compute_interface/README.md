@@ -40,10 +40,6 @@ The long form, when you want the live log or the files the job wrote:
 from compute_interface import ComputeServerClient, Refused
 
 with ComputeServerClient("http://materials-framework:8000", token) as tool:
-    caps = tool.capabilities()
-    if caps["host"]["under_emulation"]:
-        ...  # a number off this host is validated before it is used
-
     try:
         job = tool.submit(source, entrypoint="run", variables={"structure": cif})
     except Refused as refusal:
@@ -64,20 +60,23 @@ means the server will not run this and says why. `JobFailed` — raised by `run(
 `wait()` returns a failed result as data rather than raising, because a caller
 that streamed the job has usually already seen why.
 
-`refusal.reason` is one of a closed set — `instance_not_ready`,
-`operation_not_served`, `backend_not_served`, `architecture_mismatch` — so it
-can be branched on, and `refusal.context` carries what narrows it (`available`,
-for a backend or operation this instance does not serve). `refusal.detail` is
-prose; read it, do not match on it. The values are not re-declared here as an
-enum for the same reason `Capabilities` is not: `RefusalReason` in
+`refusal.reason` is one of a closed set, so it can be branched on, and
+`refusal.detail` is prose — read it, do not match on it. The values are not
+re-declared here as an enum: `RefusalReason` in
 `compute_server_base/refusal.py` owns them, and a second copy is the drift this
 package exists to stop.
+
+The refusal you will actually meet is a stale agent version. A consumer builds
+its tool-use agent from `agent.md` and the knowledge base at a release tag and
+sends that tag with every job; a server built from a different one refuses,
+rather than run real work under instructions already known to be wrong. Re-fetch
+the definition at the tag the server names and resubmit.
 
 ## What it does not do
 
 No cost model, no scheduling, no retry policy, no opinion about which
 calculation is worth running. An instrument reports; the caller decides.
 
-It also defines no copy of `Capabilities`. `capabilities()` returns the parsed
-descriptor as a dict, because a second model of the server's own shape is what
-this package exists to prevent.
+It also asks no server what its tool can do. That question is answered by
+`agent.md` and the knowledge files beside it in the tool's repository, fetched
+from git — never over the wire.

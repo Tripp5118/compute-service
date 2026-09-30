@@ -1,8 +1,14 @@
 # compute-server-base
 
-The shared half of every compute-server instance in `tools/`: the job queue,
-bearer auth, the `/capabilities` contract, and `create_app()`, which mounts
-every route an instance does not define for itself.
+The shared half of every compute-server instance: the job queue, bearer auth,
+and `create_app()`, which mounts every route an instance does not define for
+itself.
+
+**The API is CRUD for jobs.** It takes Python source, an entrypoint and its
+arguments; it queues, runs, reports and returns. It never describes or wraps the
+library the image installs — no per-operation route, no operations list, no
+call-shape descriptors. What the tool can compute is `agent.md`'s job, in the
+instance's own repository.
 
 Not published and not installed standalone — each tool image copies this
 directory in and `pip install`s it (see any `tools/*/Dockerfile`).
@@ -10,29 +16,20 @@ directory in and `pip install`s it (see any `tools/*/Dockerfile`).
 ## Writing an instance
 
 ```python
-from compute_server_base import Capabilities, Host, Operation, create_app
+from compute_server_base import create_app
 
-def _capabilities() -> Capabilities:
-    return Capabilities(
-        tool="my-tool",
-        version="1.0",
-        contract_version="1.0",
-        ready=True,
-        host=Host.native(),
-        operations=[Operation(name="relax", backends=["orb"], description="...")],
-    )
-
-app = create_app(tool_name="my-tool", capabilities=_capabilities)
+app = create_app(tool_name="my-tool")
 ```
 
-`create_app()` owns `/health`, `/capabilities`, `POST /jobs`,
-`GET /jobs/{id}`, `GET /jobs/{id}/result`, `POST /jobs/{id}/cancel`, and the
-`/jobs/{id}/stream` websocket. Add instance-specific routes to the returned
-app.
+That is the whole of it. `create_app()` owns `/health`, `POST /jobs`,
+`GET /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/result`, the file and archive
+routes, `POST /jobs/{id}/cancel`, and the `/jobs/{id}/stream` websocket.
 
-`capabilities` is called per request, so report probe results rather than a
-fixed claim — `probe_import()` and `available_backends()` are here for that.
-An operation should list only backends that actually import in this image.
+An instance may add a route for its own **input format** — LAMMPS's `POST /run`
+takes an input script, which is its native input rather than a function
+signature upstream can rename. It must not add a route that names a call into
+the library: the moment the API encodes a call signature, an upstream rename
+makes the server wrong and forces a rebuild to fix it.
 
 ## Python version
 

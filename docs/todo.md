@@ -20,8 +20,8 @@ What has to happen, in order:
 3. Give it a route. Like the dashboard, a container cannot reach `127.0.0.1:8300`,
    so MatFlow must join `spark-network` and address the tool by container name.
 4. Repoint `MaterialsFrameworkRelaxNode` at `compute_interface` while it is being
-   touched anyway — it still calls the deprecated `/mlips`, which is the other
-   reason that shim is still served.
+   touched anyway. It hand-rolls its own HTTP today, which is what let autoBO and
+   matflow both sit on a deprecated endpoint for months.
 5. Delete the static-token branch from `auth.py`. Every caller is then on signed
    tokens, and rotation becomes a real revocation mechanism rather than a partial
    one.
