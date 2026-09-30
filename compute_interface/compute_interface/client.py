@@ -2,16 +2,19 @@
 
 Two hand-rolled clients existed against this protocol before this package did
 — matflow's `ComputeServerClient` and autoBO's `PotentialRunner` — and both
-were still calling `/manifest` months after the servers moved to
-`/capabilities`. Neither noticed, because a client that ships from a different
-repository on a different cadence has nothing tying it to the contract it
-speaks. So this lives next to `compute_server_base`, and the two change in one
-commit or the drift comes back (`docs/execution-servers.md`, missing item 5).
+were still calling a deprecated endpoint months after the servers had moved on.
+Neither noticed, because a client that ships from a different repository on a
+different cadence has nothing tying it to the contract it speaks. So this lives
+next to `compute_server_base`, and the two change in one commit or the drift
+comes back.
 
-**It models nothing the server owns.** `capabilities()` hands back the parsed
-descriptor as a dict and `result()` hands back the parsed result; there is no
-second copy of `Capabilities` here to fall out of step with the first one. The
-only shape this package defines is `Refusal`, and it carries the server's four
+**The protocol is CRUD for jobs.** Send Python, poll it, read its values and
+files. There is nothing here that asks a server what its tool can do, because no
+server answers that: `agent.md` and the knowledge files in the tool's own
+repository do, fetched from git at a release tag.
+
+**It models nothing the server owns.** `result()` hands back the parsed result;
+the only shape this package defines is `Refusal`, and it carries the server's
 fields through verbatim without an opinion about what the reasons are.
 
 **A refusal is not a transport error.** `Refused` is the one exception that
@@ -38,18 +41,7 @@ import httpx
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-__all__ = ["ComputeServerClient", "ContractMismatchError", "JobFailed", "Refusal", "Refused"]
-
-# What this client is written against. Compared on the major part only: the
-# servers' PROTOCOL.md files already tell integrators to refuse a major they
-# do not understand, and this is that instruction as code.
-#
-# "0", because that is what the live servers report. Check it against them, not
-# against a stub fixture — one saying "1.0" is what hid this. The number is
-# per-instance rather than per-contract today, so a major check is all it can
-# usefully carry: under 0.x a minor bump may break, and this check would not
-# see it. Tighten it when the instances reach 1.0 and agree.
-CONTRACT_MAJOR = "0"
+__all__ = ["ComputeServerClient", "JobFailed", "Refusal", "Refused"]
 
 _TERMINAL = ("succeeded", "failed", "cancelled")
 
@@ -121,10 +113,6 @@ class JobFailed(Exception):
         self.job_traceback = result.get("traceback")
 
 
-class ContractMismatchError(Exception):
-    """The server speaks a major contract version this client was not written for."""
-
-
 class ComputeServerClient:
     """Talks to one compute server: submit, poll, read, fetch, stream.
 
@@ -139,9 +127,11 @@ class ComputeServerClient:
             `COMPUTE_SERVER_TOKEN`. The server cannot tell the two apart.
         timeout: Per-request timeout in seconds. Not a job timeout; pass
             `timeout_s` to `submit()` for that.
-        check_contract: Verify the server's major contract version on the first
-            `capabilities()` call. Turn it off only to inspect a server you
-            already know you cannot talk to.
+        agent_release: The tool repository release this caller built its
+            tool-use agent from, sent with every job. A server built from a
+            different release refuses the job rather than run work under
+            instructions that have moved on. Leave it None for a caller with no
+            agent definition to be stale — a script, a smoke test.
     """
 
     def __init__(
@@ -150,42 +140,23 @@ class ComputeServerClient:
         token: str,
         *,
         timeout: float = 30.0,
-        check_contract: bool = True,
+        agent_release: str | None = None,
     ) -> None:
         """Open the HTTP connection pool; nothing is contacted until a call is made."""
         self._base = base_url.rstrip("/")
         self._token = token
-        self._check_contract = check_contract
+        self._agent_release = agent_release
         self._client = httpx.Client(
             base_url=self._base,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
         )
 
-    # ---- what the server can do -------------------------------------------------
-
-    def capabilities(self) -> dict[str, Any]:
-        """The full descriptor: identity, versions, `ready`, `host`, and the operations.
-
-        Read `host` before trusting a number off this instance —
-        `under_emulation` true, or `arch_match` false, means the solver is
-        running on an architecture it was not built for.
-
-        Raises:
-            ContractMismatchError: If the server's major contract version differs.
-        """
-        payload = self._json(self._client.get("/capabilities"))
-        if self._check_contract:
-            major = str(payload.get("contract_version", "")).split(".")[0]
-            if major != CONTRACT_MAJOR:
-                raise ContractMismatchError(
-                    f"{self._base} speaks contract {payload.get('contract_version')!r}; "
-                    f"this client is written against {CONTRACT_MAJOR}.x"
-                )
-        return payload
-
     def health(self) -> dict[str, Any]:
-        """Unauthenticated liveness. The one call that works without a valid token."""
+        """Liveness, the tool's name, and the release it was built from.
+
+        Unauthenticated — the one call that works without a valid token.
+        """
         return self._json(httpx.get(f"{self._base}/health", timeout=10.0))
 
     # ---- running something ------------------------------------------------------
@@ -208,7 +179,10 @@ class ComputeServerClient:
         `files()` and `fetch()`.
 
         Raises:
-            Refused: The server will not run this — read `.reason`.
+            Refused: The server will not run this — read `.reason`. An
+                `agent_release_stale` refusal means this caller's tool-use agent
+                was built from a different release than the server; re-fetch the
+                definition at the release the refusal names and resubmit.
         """
         return str(
             self._json(
@@ -220,6 +194,7 @@ class ComputeServerClient:
                         "variables": variables or {},
                         "correlation_id": correlation_id,
                         "timeout_s": timeout_s,
+                        "agent_release": self._agent_release,
                     },
                 )
             )["job_id"]

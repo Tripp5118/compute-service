@@ -24,6 +24,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+import httpx
 import pytest
 
 if TYPE_CHECKING:
@@ -33,32 +34,10 @@ if TYPE_CHECKING:
 os.environ.setdefault("COMPUTE_SERVER_TOKEN", "test-token-for-pytest")
 
 import uvicorn  # noqa: E402 — env var must be set before the server imports
-from compute_server_base import Capabilities, Host, Operation, create_app  # noqa: E402
-from compute_interface import ComputeServerClient, ContractMismatchError, JobFailed, Refused  # noqa: E402
+from compute_server_base import create_app  # noqa: E402
+from compute_interface import ComputeServerClient, JobFailed, Refused  # noqa: E402
 
 TOKEN = os.environ["COMPUTE_SERVER_TOKEN"]
-
-
-def _capabilities() -> Capabilities:
-    return Capabilities(
-        tool="stub",
-        version="0.0",
-        contract_version="0.4",
-        ready=True,
-        host=Host.native(),
-        operations=[Operation(name="echo", backends=["installed"], description="Double a number.")],
-    )
-
-
-def _not_ready() -> Capabilities:
-    return Capabilities(
-        tool="stub",
-        version="0.0",
-        contract_version="0.4",
-        ready=False,
-        host=Host(container_arch="x86_64"),
-        operations=[],
-    )
 
 
 def _free_port() -> int:
@@ -67,12 +46,16 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def _serve(capabilities: Any, workspace: Path) -> Iterator[str]:
+def _serve(workspace: Path, *, release: str | None = None) -> Iterator[str]:
     """Run one compute server on a loopback port for the life of a test."""
     os.environ["JOB_WORKSPACE_ROOT"] = str(workspace)
+    if release is None:
+        os.environ.pop("RELEASE", None)
+    else:
+        os.environ["RELEASE"] = release
     port = _free_port()
 
-    app = create_app(tool_name="stub", capabilities=capabilities)
+    app = create_app(tool_name="stub")
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -90,40 +73,43 @@ def _serve(capabilities: Any, workspace: Path) -> Iterator[str]:
 @pytest.fixture
 def ready_url(tmp_path: Path) -> Iterator[str]:
     """A server that will run jobs."""
-    yield from _serve(_capabilities, tmp_path / "ready")
+    yield from _serve(tmp_path / "ready")
 
 
 @pytest.fixture
-def not_ready_url(tmp_path: Path) -> Iterator[str]:
-    """A server whose compute is absent — thermocalc with no engine bind-mounted."""
-    yield from _serve(_not_ready, tmp_path / "not-ready")
+def released_url(tmp_path: Path) -> Iterator[str]:
+    """A server built from a known release, for the staleness check."""
+    yield from _serve(tmp_path / "released", release="v2.0.0")
 
 
-def test_capabilities_comes_back_whole(ready_url: str) -> None:
-    """The descriptor is passed through, not remodelled — including the host block."""
-    with ComputeServerClient(ready_url, TOKEN) as client:
-        payload = client.capabilities()
+def test_health_carries_identity_and_release(released_url: str) -> None:
+    """The one unauthenticated call, and the cheap way to see what a server is."""
+    with ComputeServerClient(released_url, TOKEN) as client:
+        payload = client.health()
 
+    assert payload["status"] == "ok"
     assert payload["tool"] == "stub"
-    assert payload["ready"] is True
-    # The fields that decide whether a number can be trusted have to survive the trip.
-    assert "under_emulation" in payload["host"]
-    assert [op["name"] for op in payload["operations"]] == ["echo"]
+    assert payload["release"] == "v2.0.0"
 
 
-def test_a_contract_this_client_cannot_speak_is_refused_up_front(ready_url: str) -> None:
-    """The drift this package exists to stop, caught rather than papered over."""
-    with ComputeServerClient(ready_url, TOKEN) as client:
-        client._check_contract = True  # noqa: SLF001 — pinning the behaviour under test
-        import compute_interface.client as module
+def test_a_stale_agent_definition_is_refused_rather_than_run(released_url: str) -> None:
+    """The drift this package exists to stop, caught at the moment of use.
 
-        original = module.CONTRACT_MAJOR
-        module.CONTRACT_MAJOR = "9"
-        try:
-            with pytest.raises(ContractMismatchError):
-                client.capabilities()
-        finally:
-            module.CONTRACT_MAJOR = original
+    A consumer builds its tool-use agent from agent.md at a release; if the
+    server has moved past it, the instructions may describe a build this is not.
+    """
+    with ComputeServerClient(released_url, TOKEN, agent_release="v1.0.0") as client, pytest.raises(Refused) as caught:
+        client.submit("def run():\n    return {}\n")
+
+    assert caught.value.reason == "agent_release_stale"
+    assert caught.value.context == {"agent_release": "v1.0.0", "server_release": "v2.0.0"}
+    # A dead end the caller acts on, not a transport failure to retry.
+    assert not isinstance(caught.value, httpx.HTTPError)
+
+
+def test_a_matching_release_is_not_refused(released_url: str) -> None:
+    with ComputeServerClient(released_url, TOKEN, agent_release="v2.0.0") as client:
+        assert client.run("def run():\n    return {'ok': 1}\n") == {"ok": 1}
 
 
 def test_submit_wait_and_read_a_result(ready_url: str) -> None:
@@ -211,19 +197,16 @@ def test_log_output_arrives_while_the_job_is_still_running(ready_url: str) -> No
     assert any("step 2" in line for line in lines)
 
 
-def test_a_refusal_is_not_a_transport_error(not_ready_url: str) -> None:
+def test_a_refusal_carries_prose_a_caller_can_act_on(released_url: str) -> None:
     """The distinction the whole refusal shape exists for.
 
     A caller that catches `Refused` is handling a dead end it can report and
     work around. A caller that catches `httpx.HTTPError` is handling breakage.
     They must not arrive as the same type.
     """
-    with ComputeServerClient(not_ready_url, TOKEN) as client, pytest.raises(Refused) as caught:
+    with ComputeServerClient(released_url, TOKEN, agent_release="v1.0.0") as client, pytest.raises(Refused) as caught:
         client.submit("def run():\n    return 1\n")
 
-    assert caught.value.reason == "instance_not_ready"
     assert "stub" in caught.value.detail
-    # Not an httpx error wearing a different coat.
-    import httpx
-
-    assert not isinstance(caught.value, httpx.HTTPError)
+    # The release to re-fetch at has to be in the prose, not only the context.
+    assert "v2.0.0" in caught.value.detail

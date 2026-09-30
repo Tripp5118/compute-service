@@ -1,18 +1,25 @@
 """The shared half of every compute-server instance: routes, auth, job plumbing.
 
-`create_app()` owns everything that was byte-identical between the
-materials-framework and thermocalc servers. An instance contributes exactly
-two things: a Capabilities descriptor, and whatever startup probing its own
-toolchain needs. LAMMPS would have been the third copy — see
-docs/infra-cleanup-2026-08.md S-1.
+The API is CRUD for jobs. It takes Python source, an entrypoint and that
+entrypoint's arguments, queues it, runs it in a child process, and reports what
+happened. It says nothing about the library the image installs — no route naming
+a call into it, no descriptor of what it can compute. That question is answered
+by `agent.md` and the knowledge files in each instance's own repository, which a
+consumer fetches at a release tag.
 
-Instances may still add their own routes to the returned app; that is how the
-deprecated /manifest and /mlips shims survive their migration period.
+The reason is coupling: an endpoint per calculation encodes that library's
+current call signature, so an upstream rename makes the *server* wrong and forces
+a rebuild to say the same thing differently. Job code has no such problem — it is
+written by the consumer who is already reading that library's documentation.
+
+An instance may add a route for its own *input format* (LAMMPS's `POST /run`
+takes an input script), which is not the same as a route for a library call.
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
 import tarfile
 import tempfile
 import time
@@ -25,16 +32,21 @@ from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from compute_server_base.auth import check_ws_token, require_token, set_audience
-
-# Runtime import, not TYPE_CHECKING: FastAPI resolves the /capabilities return
-# annotation into a response model when the route is registered, and a forward
-# ref it can't resolve fails at request time, not import time.
-from compute_server_base.capabilities import Capabilities  # noqa: TC001 — see above; must resolve at runtime
 from compute_server_base.jobs import TERMINAL_STATUSES, JobManager, JobStatus
-from compute_server_base.refusal import RefusalReason, Refused, not_ready_detail, refuse
+from compute_server_base.refusal import RefusalReason, Refused, refuse, stale_agent_detail
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
+
+
+def release() -> str | None:
+    """The tool repository release this image was built from, or None if unstamped.
+
+    Set from a `RELEASE` build argument. It is the one version on the wire: the
+    image, `agent.md` and the knowledge base all come from this tag, so a
+    consumer holding a different one is holding a stale agent definition.
+    """
+    return os.environ.get("RELEASE") or None
 
 
 class JobRequest(BaseModel):
@@ -45,24 +57,25 @@ class JobRequest(BaseModel):
     variables: dict[str, Any] = {}
     correlation_id: str | None = None
     timeout_s: float | None = None
+    # The release the caller built its tool-use agent from. A mismatch means the
+    # caller is working from instructions this build has moved past, so the job
+    # is refused rather than run. None skips the check, for a caller that has no
+    # agent definition to be stale — a human with curl, a smoke test.
+    agent_release: str | None = None
 
 
 def create_app(
     *,
     tool_name: str,
-    capabilities: Callable[[], Capabilities],
     on_startup: Callable[[], None] | None = None,
 ) -> FastAPI:
     """Build an instance's FastAPI app with the shared routes mounted.
 
     Args:
         tool_name: Identity reported in job provenance and the app title.
-        capabilities: Called per request rather than once at import, so an
-            instance reports what is true now — a mount that disappeared or a
-            probe that started failing shows up without a restart.
         on_startup: Instance-specific startup probing, run after the job worker
             starts. Raising here aborts startup; log instead if the server
-            should come up degraded and report it through `capabilities`.
+            should come up degraded.
 
     Returns:
         The app, with `app.state.jobs` holding the JobManager.
@@ -85,18 +98,13 @@ def create_app(
     app.state.jobs = manager
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        """Unauthenticated liveness check."""
-        return {"status": "ok"}
+    async def health() -> dict[str, str | None]:
+        """Unauthenticated liveness, plus who this is and what it was built from."""
+        return {"status": "ok", "tool": tool_name, "release": release()}
 
-    @app.get("/capabilities", dependencies=[Depends(require_token)])
-    async def get_capabilities() -> Capabilities:
-        """What this instance can do and whether it can do it on this host."""
-        return capabilities()
-
-    # A refusal is the same body on both faces (see refusal.py). Routes raise
-    # it; this turns it into 422 rather than letting it surface as a 500, which
-    # is what "this broke" looks like and is exactly the confusion being fixed.
+    # A refusal is a value, not a failure (see refusal.py). Routes raise it; this
+    # turns it into 422 rather than letting it surface as a 500, which is what
+    # "this broke" looks like and is exactly the confusion being fixed.
     @app.exception_handler(Refused)
     async def _refused(_request: Request, exc: Refused) -> JSONResponse:
         return JSONResponse(status_code=422, content=exc.refusal.model_dump(mode="json"))
@@ -104,8 +112,14 @@ def create_app(
     @app.post("/jobs", dependencies=[Depends(require_token)])
     async def create_job(req: JobRequest) -> dict[str, str]:
         """Enqueue a job; returns immediately with a job_id in queued status."""
-        if not capabilities().ready:
-            raise refuse(RefusalReason.INSTANCE_NOT_READY, not_ready_detail(tool_name))
+        built_from = release()
+        if req.agent_release is not None and built_from is not None and req.agent_release != built_from:
+            raise refuse(
+                RefusalReason.AGENT_RELEASE_STALE,
+                stale_agent_detail(tool_name, req.agent_release, built_from),
+                agent_release=req.agent_release,
+                server_release=built_from,
+            )
         job = await manager.submit(req.code, req.entrypoint, req.variables, req.correlation_id, req.timeout_s)
         return {"job_id": job.id, "status": job.status.value}
 
@@ -172,6 +186,9 @@ def create_app(
             "files": job.files(),
             "provenance": {
                 "tool_name": tool_name,
+                # Which build produced this number. A result that cannot say
+                # that cannot be reproduced against the right image later.
+                "release": release(),
                 "wall_time_s": job.wall_time_s(),
             },
         }

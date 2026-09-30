@@ -1,41 +1,30 @@
 """Shared compute-server template for tool-server instances.
 
-Installed into each tool image (see any tools/*/Dockerfile). An instance's
-`server/main.py` supplies a Capabilities descriptor and its own startup
-probing; everything else comes from here.
+Installed into each tool image. The API is CRUD for jobs: an instance's
+`server/main.py` supplies its name and, at most, a startup probe and a route for
+its own input format. It does not describe the library the image installs —
+`agent.md` and the knowledge files in the instance's own repository do that, and
+a consumer fetches them from git at a release tag.
 """
 
-from compute_server_base.app import JobRequest, create_app
+from compute_server_base.app import JobRequest, create_app, release
 from compute_server_base.auth import check_ws_token, require_token
-from compute_server_base.capabilities import (
-    Capabilities,
-    Host,
-    Operation,
-    available_backends,
-    probe_import,
-    under_emulation,
-)
 from compute_server_base.jobs import TERMINAL_STATUSES, JobManager, JobStatus
-from compute_server_base.refusal import Refusal, RefusalReason, Refused, not_ready_detail, refusal, refuse
+from compute_server_base.refusal import Refusal, RefusalReason, Refused, refusal, refuse, stale_agent_detail
 
 __all__ = [
     "TERMINAL_STATUSES",
-    "Capabilities",
-    "Host",
     "JobManager",
     "JobRequest",
     "JobStatus",
-    "Operation",
     "Refusal",
     "RefusalReason",
     "Refused",
-    "available_backends",
     "check_ws_token",
     "create_app",
-    "not_ready_detail",
-    "probe_import",
     "refusal",
     "refuse",
+    "release",
     "require_token",
-    "under_emulation",
+    "stale_agent_detail",
 ]

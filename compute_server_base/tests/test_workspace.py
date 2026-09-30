@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 os.environ.setdefault("COMPUTE_SERVER_TOKEN", "test-token-for-pytest")
 os.environ["JOB_WORKSPACE_ROOT"] = tempfile.mkdtemp(prefix="workspace-test-")
 
-from compute_server_base import Capabilities, Host, create_app  # noqa: E402 — env must be set before import
+from compute_server_base import create_app  # noqa: E402 — env must be set before import
 
 AUTH = {"Authorization": f"Bearer {os.environ['COMPUTE_SERVER_TOKEN']}"}
 
@@ -44,11 +44,7 @@ def run():
 """
 
 
-def _capabilities() -> Capabilities:
-    return Capabilities(tool="stub", version="0.0", contract_version="1.0", ready=True, host=Host.native())
-
-
-app = create_app(tool_name="stub", capabilities=_capabilities)
+app = create_app(tool_name="stub")
 
 
 def _run(client: TestClient, code: str) -> str:

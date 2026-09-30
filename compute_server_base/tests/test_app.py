@@ -20,7 +20,7 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("COMPUTE_SERVER_TOKEN", "test-token-for-pytest")
 
-from compute_server_base import Capabilities, Host, Operation, create_app  # noqa: E402 — env var must be set before import
+from compute_server_base import create_app  # noqa: E402 — env var must be set before import
 
 TOKEN = os.environ["COMPUTE_SERVER_TOKEN"]
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
@@ -61,18 +61,7 @@ def run():
 """
 
 
-def _capabilities() -> Capabilities:
-    return Capabilities(
-        tool="stub",
-        version="0.0",
-        contract_version="1.0",
-        ready=True,
-        host=Host.native(),
-        operations=[Operation(name="echo", backends=["python"], description="Double a number.")],
-    )
-
-
-app = create_app(tool_name="stub", capabilities=_capabilities)
+app = create_app(tool_name="stub")
 
 
 def _still_running(pid: int) -> bool:
@@ -102,24 +91,67 @@ def _wait_for_terminal(client: TestClient, job_id: str, timeout_s: float = 30.0)
 def test_health_requires_no_auth():
     """/health is the liveness probe, so it must answer before any token exists."""
     with TestClient(app) as client:
-        assert client.get("/health").json() == {"status": "ok"}
+        body = client.get("/health").json()
+    assert body["status"] == "ok"
+    assert body["tool"] == "stub"
 
 
-@pytest.mark.parametrize("path", ["/capabilities", "/jobs/anything"])
+@pytest.mark.parametrize("path", ["/jobs", "/jobs/anything"])
 def test_authenticated_routes_reject_missing_token(path: str):
     """The bearer token is the only trust boundary — see jobs.py on why."""
     with TestClient(app) as client:
         assert client.get(path).status_code == 401
 
 
-def test_capabilities_reports_the_descriptor():
-    """/capabilities serves what the instance supplied, in S-2's shape."""
+def test_the_server_describes_no_operations_at_all():
+    """The API is job CRUD. Nothing here says what the hosted tool can compute.
+
+    A route naming a call into the library would pin this server to a signature
+    upstream can rename, which is the coupling this contract exists without.
+    """
     with TestClient(app) as client:
-        body = client.get("/capabilities", headers=AUTH).json()
-        assert body["tool"] == "stub"
-        assert body["ready"] is True
-        assert body["host"]["container_arch"]
-        assert body["operations"][0]["backends"] == ["python"]
+        assert client.get("/capabilities", headers=AUTH).status_code == 404
+
+
+def test_a_job_from_a_stale_agent_is_refused_rather_than_run(monkeypatch):
+    """Work under instructions known to be stale is worse than work not done.
+
+    Nothing downstream can tell a number computed against the wrong build from a
+    right one, so the refusal happens before the job is queued.
+    """
+    monkeypatch.setenv("RELEASE", "v2.0.0")
+    with TestClient(app) as client:
+        resp = client.post("/jobs", headers=AUTH, json={"code": ECHO, "variables": {"x": 1}, "agent_release": "v1.0.0"})
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["refused"] is True
+    assert body["reason"] == "agent_release_stale"
+    # Both sides named, so the caller knows which release to re-fetch at.
+    assert body["context"] == {"agent_release": "v1.0.0", "server_release": "v2.0.0"}
+
+
+def test_a_matching_release_runs(monkeypatch):
+    monkeypatch.setenv("RELEASE", "v2.0.0")
+    with TestClient(app) as client:
+        resp = client.post("/jobs", headers=AUTH, json={"code": ECHO, "variables": {"x": 1}, "agent_release": "v2.0.0"})
+    assert resp.status_code == 200
+
+
+def test_a_caller_with_no_agent_definition_is_not_version_checked(monkeypatch):
+    """A script or a smoke test has no agent to be stale, so it is not gated."""
+    monkeypatch.setenv("RELEASE", "v2.0.0")
+    with TestClient(app) as client:
+        resp = client.post("/jobs", headers=AUTH, json={"code": ECHO, "variables": {"x": 1}})
+    assert resp.status_code == 200
+
+
+def test_an_unstamped_build_does_not_refuse_everything(monkeypatch):
+    """No RELEASE means unknown, and unknown must not read as a mismatch."""
+    monkeypatch.delenv("RELEASE", raising=False)
+    with TestClient(app) as client:
+        resp = client.post("/jobs", headers=AUTH, json={"code": ECHO, "variables": {"x": 1}, "agent_release": "v1.0.0"})
+    assert resp.status_code == 200
 
 
 def test_submit_poll_result():
