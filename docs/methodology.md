@@ -93,7 +93,7 @@ from the installed reality and every consumer needs its own copy.
 
 Agents reach it through an MCP endpoint mounted on the same FastAPI app, in the
 same process, behind the same bearer token — no second service, no second
-credential path. MCP tools are the S-2 operations in async form (`submit_*`
+credential path. MCP tools are the advertised operations in async form (`submit_*`
 returns a job id; `get_job`/`get_result`/`cancel_job` read it, nothing blocks);
 resources are the pack; prompts are its `prompts/` documents.
 
