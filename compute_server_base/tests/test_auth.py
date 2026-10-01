@@ -10,7 +10,9 @@ Run:
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+# datetime.UTC is 3.11+, and this package's floor is 3.10 for the thermocalc
+# image. timezone.utc is the same object under a name that exists there.
+from datetime import datetime, timedelta, timezone
 
 import jwt
 import pytest
@@ -22,7 +24,7 @@ STATIC = "static-shared-token"
 
 
 def _token(*, secret: str = SECRET, audience: str = "tool:stub", subject: str = "autobo-worker", age_s: int = 0) -> str:
-    now = datetime.now(tz=UTC)
+    now = datetime.now(tz=timezone.utc)
     return jwt.encode(
         {"sub": subject, "aud": audience, "iat": now, "exp": now + timedelta(seconds=3600 - age_s)},
         secret,

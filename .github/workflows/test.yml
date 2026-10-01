@@ -1,0 +1,35 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor both pyproject.toml files declare, and it is a real
+        # target rather than a formality: the thermocalc image is pinned to
+        # python:3.10-slim-bookworm for TC-Python, and this package has to
+        # import there. 3.12 is what every other image runs.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: compute_server_base
+        working-directory: compute_server_base
+        # httpx is not a dependency of the package, only of fastapi's TestClient.
+        run: uv run --with pytest --with httpx pytest tests -q
+
+      - name: compute_interface
+        working-directory: compute_interface
+        # The client tests run a real server in a thread, so they need both the
+        # sibling package and something to serve it with.
+        run: uv run --with pytest --with uvicorn --with ../compute_server_base pytest tests -q
