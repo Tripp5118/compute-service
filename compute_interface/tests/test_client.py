@@ -210,3 +210,59 @@ def test_a_refusal_carries_prose_a_caller_can_act_on(released_url: str) -> None:
     assert "stub" in caught.value.detail
     # The release to re-fetch at has to be in the prose, not only the context.
     assert "v2.0.0" in caught.value.detail
+
+
+def test_a_dropped_read_is_retried_rather_than_surfaced(monkeypatch):
+    """A connection reset while fetching a finished job's result is not a failed job.
+
+    On 2026-10-28 a campaign lost three smoke evaluations to
+    `ReadError: [Errno 104] Connection reset by peer` while reading results. Every job on
+    the server reported `succeeded`; only the wire broke. The caller could not tell the
+    difference, reported an infrastructure failure, and the GPU work was thrown away.
+    """
+    import httpx
+
+    from compute_interface.client import ComputeServerClient
+
+    client = ComputeServerClient("http://example.invalid", "token")
+
+    calls = {"n": 0}
+
+    def flaky(path: str):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise httpx.ReadError("Connection reset by peer")
+        return httpx.Response(
+            200,
+            json={"values": {"ok": True}, "error": None},
+            request=httpx.Request("GET", "http://example.invalid" + path),
+        )
+
+    monkeypatch.setattr(client._client, "get", flaky)
+    monkeypatch.setattr("compute_interface.client._READ_BACKOFF_S", 0.0)
+
+    assert client.result("job-1")["values"] == {"ok": True}
+    assert calls["n"] == 3, "should have retried twice before succeeding"
+
+
+def test_submit_is_never_retried_after_the_request_is_sent(monkeypatch):
+    """Re-sending a POST whose reply was lost can enqueue the same work twice, and a
+    duplicate ten-minute GPU job is worse than an error the caller can see."""
+    import httpx
+    import pytest as _pytest
+
+    from compute_interface.client import ComputeServerClient
+
+    client = ComputeServerClient("http://example.invalid", "token")
+
+    calls = {"n": 0}
+
+    def always_drops(*args, **kwargs):
+        calls["n"] += 1
+        raise httpx.ReadError("Connection reset by peer")
+
+    monkeypatch.setattr(client._client, "post", always_drops)
+
+    with _pytest.raises(httpx.ReadError):
+        client.submit("def run():\n    return {}")
+    assert calls["n"] == 1, "submit must be attempted exactly once"

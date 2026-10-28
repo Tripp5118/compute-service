@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 
+import logging
 import httpx
 
 if TYPE_CHECKING:
@@ -44,6 +45,17 @@ if TYPE_CHECKING:
 __all__ = ["ComputeServerClient", "JobFailed", "Refusal", "Refused"]
 
 _TERMINAL = ("succeeded", "failed", "cancelled")
+
+
+logger = logging.getLogger(__name__)
+
+#: Connection-level retries httpx applies before a request is sent. Safe for every verb,
+#: because nothing has reached the server yet.
+_CONNECT_RETRIES = 2
+
+#: Retries for the idempotent GETs, which may repeat because the job has already run.
+_READ_RETRIES = 3
+_READ_BACKOFF_S = 1.5
 
 
 @dataclass(frozen=True)
@@ -150,6 +162,9 @@ class ComputeServerClient:
             base_url=self._base,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout,
+            # Retries the connection itself. httpx only applies this before the request is
+            # sent, so it never re-sends a POST whose job may already exist.
+            transport=httpx.HTTPTransport(retries=_CONNECT_RETRIES),
         )
 
     def health(self) -> dict[str, Any]:
@@ -202,11 +217,16 @@ class ComputeServerClient:
 
     def status(self, job_id: str) -> str:
         """One of queued, running, succeeded, failed, cancelled."""
-        return str(self._json(self._client.get(f"/jobs/{job_id}"))["status"])
+        return str(self._json(self._get(f"/jobs/{job_id}"))["status"])
 
     def result(self, job_id: str) -> dict[str, Any]:
-        """Values, error, file manifest and provenance. 409s while the job is unfinished."""
-        return self._json(self._client.get(f"/jobs/{job_id}/result"))
+        """Values, error, file manifest and provenance. 409s while the job is unfinished.
+
+        A dropped connection here does not mean the job failed. The work is finished and
+        sitting on the server, so this retries rather than surfacing a transport error that
+        a caller would reasonably read as a failed evaluation and pay for again.
+        """
+        return self._json(self._get(f"/jobs/{job_id}/result"))
 
     def wait(self, job_id: str, *, poll_s: float = 1.0, timeout_s: float | None = None) -> dict[str, Any]:
         """Poll until the job reaches a terminal status, then return its result.
@@ -276,7 +296,7 @@ class ComputeServerClient:
         is why nothing else is progressing: a server runs one job at a time, so
         a job that cannot finish holds every job behind it.
         """
-        return self._json(self._client.get("/jobs"))
+        return self._json(self._get("/jobs"))
 
     def cancel(self, job_id: str) -> bool:
         """Best-effort. A queued job is dropped; a running one has its result discarded."""
@@ -313,7 +333,7 @@ class ComputeServerClient:
 
     def files(self, job_id: str) -> list[dict[str, Any]]:
         """The workspace manifest — path, size, mtime. No contents."""
-        return list(self._json(self._client.get(f"/jobs/{job_id}/files"))["files"])
+        return list(self._json(self._get(f"/jobs/{job_id}/files"))["files"])
 
     def fetch(self, job_id: str, path: str, dest: str | Path) -> Path:
         """Stream one file out of the workspace to `dest`, which may be a directory."""
@@ -358,6 +378,34 @@ class ComputeServerClient:
     def __exit__(self, *_exc: object) -> None:
         """Close the pool."""
         self.close()
+
+    def _get(self, path: str) -> httpx.Response:
+        """GET with a retry, for the reads that are safe to repeat.
+
+        Reading a job's status, result or file list is idempotent: the job has already run
+        and asking twice changes nothing. A transport error on one of these says the wire
+        broke, not that the work failed -- and a caller that cannot tell the difference
+        treats a finished ten-minute evaluation as a failure and resubmits it.
+
+        Deliberately not used for `submit` or `cancel`. Re-sending a POST whose response was
+        lost can enqueue the same work twice, and a duplicate job is worse than an error the
+        caller can see.
+        """
+        last: Exception | None = None
+        for attempt in range(_READ_RETRIES + 1):
+            try:
+                return self._client.get(path)
+            except (httpx.TransportError, httpx.RemoteProtocolError) as exc:
+                last = exc
+                if attempt == _READ_RETRIES:
+                    break
+                logger.warning(
+                    "GET %s failed with %s; retry %d of %d",
+                    path, type(exc).__name__, attempt + 1, _READ_RETRIES,
+                )
+                time.sleep(_READ_BACKOFF_S * 2**attempt)
+        assert last is not None
+        raise last
 
     def _json(self, response: httpx.Response) -> dict[str, Any]:
         self._raise(response)
