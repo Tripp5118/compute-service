@@ -266,3 +266,101 @@ def test_submit_is_never_retried_after_the_request_is_sent(monkeypatch):
     with _pytest.raises(httpx.ReadError):
         client.submit("def run():\n    return {}")
     assert calls["n"] == 1, "submit must be attempted exactly once"
+
+
+def test_no_tls_material_configured_leaves_the_defaults_alone(monkeypatch):
+    """A tool reached directly over http:// on its own host must keep working untouched —
+    the gateway variables exist for callers that cross a machine, not for every caller."""
+    from compute_interface.client import _tls_kwargs
+
+    for var in ("COMPUTE_CA_BUNDLE", "COMPUTE_CLIENT_CERT", "COMPUTE_CLIENT_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    assert _tls_kwargs() == {}
+
+
+def test_tls_material_is_read_from_the_environment(monkeypatch):
+    from compute_interface.client import _tls_kwargs
+
+    monkeypatch.setenv("COMPUTE_CA_BUNDLE", "/etc/spark-lab/certs/ca.pem")
+    monkeypatch.setenv("COMPUTE_CLIENT_CERT", "/etc/spark-lab/certs/client.pem")
+    monkeypatch.setenv("COMPUTE_CLIENT_KEY", "/etc/spark-lab/certs/client-key.pem")
+
+    assert _tls_kwargs() == {
+        "verify": "/etc/spark-lab/certs/ca.pem",
+        "cert": ("/etc/spark-lab/certs/client.pem", "/etc/spark-lab/certs/client-key.pem"),
+    }
+
+
+def test_half_a_client_certificate_is_an_error_rather_than_a_handshake_failure(monkeypatch):
+    """Setting the cert and forgetting the key otherwise surfaces as an opaque TLS error
+    from inside httpx, a long way from the one line that caused it."""
+    import pytest as _pytest
+
+    from compute_interface.client import _tls_kwargs
+
+    monkeypatch.delenv("COMPUTE_CA_BUNDLE", raising=False)
+    monkeypatch.setenv("COMPUTE_CLIENT_CERT", "/etc/spark-lab/certs/client.pem")
+    monkeypatch.delenv("COMPUTE_CLIENT_KEY", raising=False)
+
+    with _pytest.raises(ValueError, match="COMPUTE_CLIENT_KEY"):
+        _tls_kwargs()
+
+
+def test_a_gateway_path_prefix_survives_into_the_websocket_url(monkeypatch):
+    """Behind a per-Spark gateway the base carries a path, and a socket dialled at the bare
+    host misses the prefix the gateway routes on — so the stream 404s while every other
+    call on the same client works."""
+    from compute_interface.client import ComputeServerClient
+
+    dialled = {}
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def recv(self):
+            raise OSError("closed")
+
+    def fake_connect(url, **kwargs):
+        dialled["url"] = url
+        dialled["ssl"] = kwargs.get("ssl")
+        return FakeSocket()
+
+    monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
+
+    client = ComputeServerClient("https://10.125.153.116:8443/materials-framework", "token")
+    list(client.stream("job-1"))
+
+    assert dialled["url"] == "wss://10.125.153.116:8443/materials-framework/jobs/job-1/stream"
+
+
+def test_a_direct_http_base_still_streams_at_the_root(monkeypatch):
+    from compute_interface.client import ComputeServerClient
+
+    dialled = {}
+
+    class FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def recv(self):
+            raise OSError("closed")
+
+    def fake_connect(url, **kwargs):
+        dialled["url"] = url
+        dialled["ssl"] = kwargs.get("ssl")
+        return FakeSocket()
+
+    monkeypatch.setattr("websockets.sync.client.connect", fake_connect)
+
+    client = ComputeServerClient("http://materials-framework:8000", "token")
+    list(client.stream("job-1"))
+
+    assert dialled["url"] == "ws://materials-framework:8000/jobs/job-1/stream"
+    assert dialled["ssl"] is None, "a plain ws:// stream must not be handed an SSL context"

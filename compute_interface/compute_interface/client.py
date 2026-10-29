@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
+import ssl
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +58,43 @@ _CONNECT_RETRIES = 2
 #: Retries for the idempotent GETs, which may repeat because the job has already run.
 _READ_RETRIES = 3
 _READ_BACKOFF_S = 1.5
+
+#: TLS material for reaching a server through a gateway that terminates HTTPS and asks for a
+#: client certificate. Read from the environment rather than taken as arguments: a generated
+#: campaign builds its own client, so a `cert=` parameter would mean teaching the agent about
+#: certificate paths, which is configuration surface autoBO does not hand it.
+_CA_BUNDLE_ENV = "COMPUTE_CA_BUNDLE"
+_CLIENT_CERT_ENV = "COMPUTE_CLIENT_CERT"
+_CLIENT_KEY_ENV = "COMPUTE_CLIENT_KEY"
+
+
+def _tls_kwargs() -> dict[str, Any]:
+    """httpx TLS arguments from the environment, empty when none are set.
+
+    All three unset is a supported state, not a misconfiguration: it means default CA
+    verification and no client certificate, which is what a plain `http://tool:8000` call on
+    a host serving its own tools needs. Those must keep working untouched.
+    """
+    cert, key = os.environ.get(_CLIENT_CERT_ENV), os.environ.get(_CLIENT_KEY_ENV)
+    if bool(cert) != bool(key):
+        raise ValueError(f"set both {_CLIENT_CERT_ENV} and {_CLIENT_KEY_ENV}, or neither")
+    kwargs: dict[str, Any] = {}
+    if ca := os.environ.get(_CA_BUNDLE_ENV):
+        kwargs["verify"] = ca
+    if cert and key:
+        kwargs["cert"] = (cert, key)
+    return kwargs
+
+
+def _ws_ssl_context() -> ssl.SSLContext | None:
+    """The same material as `_tls_kwargs`, in the form `websockets` takes for a `wss://` URL."""
+    tls = _tls_kwargs()
+    if not tls:
+        return None
+    context = ssl.create_default_context(cafile=tls.get("verify"))
+    if cert := tls.get("cert"):
+        context.load_cert_chain(*cert)
+    return context
 
 
 @dataclass(frozen=True)
@@ -165,6 +204,7 @@ class ComputeServerClient:
             # Retries the connection itself. httpx only applies this before the request is
             # sent, so it never re-sends a POST whose job may already exist.
             transport=httpx.HTTPTransport(retries=_CONNECT_RETRIES),
+            **_tls_kwargs(),
         )
 
     def health(self) -> dict[str, Any]:
@@ -172,7 +212,7 @@ class ComputeServerClient:
 
         Unauthenticated — the one call that works without a valid token.
         """
-        return self._json(httpx.get(f"{self._base}/health", timeout=10.0))
+        return self._json(httpx.get(f"{self._base}/health", timeout=10.0, **_tls_kwargs()))
 
     # ---- running something ------------------------------------------------------
 
@@ -318,9 +358,17 @@ class ComputeServerClient:
         # `import compute_interface`.
         from websockets.sync.client import connect
 
-        scheme, netloc, *_ = urlsplit(self._base)
-        ws_url = urlunsplit(("wss" if scheme == "https" else "ws", netloc, f"/jobs/{job_id}/stream", "", ""))
-        with connect(ws_url, additional_headers={"Authorization": f"Bearer {self._token}"}) as socket:
+        # The base path is carried through, not dropped: behind a gateway the base is
+        # `https://host:8443/materials-framework`, and a socket dialled at the bare host
+        # misses the prefix the gateway routes on.
+        split = urlsplit(self._base)
+        scheme = "wss" if split.scheme == "https" else "ws"
+        ws_url = urlunsplit((scheme, split.netloc, f"{split.path}/jobs/{job_id}/stream", "", ""))
+        with connect(
+            ws_url,
+            additional_headers={"Authorization": f"Bearer {self._token}"},
+            ssl=_ws_ssl_context() if scheme == "wss" else None,
+        ) as socket:
             while True:
                 try:
                     message = socket.recv()
