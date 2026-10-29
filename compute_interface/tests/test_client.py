@@ -416,3 +416,27 @@ def test_health_works_when_a_client_certificate_is_configured(monkeypatch, tmp_p
     assert seen["verify"] is sentinel
     assert "cert" not in seen
     assert seen["url"] == "https://host:8443/materials-framework/health"
+
+
+def test_tls_material_reaches_the_transport_not_just_the_client(monkeypatch):
+    """httpx ignores `verify=` on a Client when an explicit transport is supplied, because the
+    transport holds the SSL context. Putting it on the Client left every real request using
+    default verification while health() -- which builds a plain client -- still worked, so a
+    server read as reachable and then refused every job."""
+    from compute_interface.client import ComputeServerClient
+
+    sentinel = object()
+    monkeypatch.setattr("compute_interface.client._tls_kwargs", lambda: {"verify": sentinel})
+
+    seen = {}
+
+    class FakeTransport:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+    monkeypatch.setattr("compute_interface.client.httpx.HTTPTransport", FakeTransport)
+
+    ComputeServerClient("https://host:8443/materials-framework", "token")
+
+    assert seen.get("verify") is sentinel, "SSL context must be given to the transport"
+    assert "retries" in seen, "connection retries must survive alongside the TLS material"

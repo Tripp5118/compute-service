@@ -204,8 +204,13 @@ class ComputeServerClient:
             timeout=timeout,
             # Retries the connection itself. httpx only applies this before the request is
             # sent, so it never re-sends a POST whose job may already exist.
-            transport=httpx.HTTPTransport(retries=_CONNECT_RETRIES),
-            **_tls_kwargs(),
+            #
+            # The TLS material goes on the transport, not on the Client: httpx silently ignores
+            # `verify=` when an explicit transport is supplied, because the transport is what
+            # holds the SSL context. Passing it to the Client left every real request falling
+            # back to default verification while `health()` -- which builds a plain client --
+            # succeeded, so a server read as reachable and then refused every job.
+            transport=httpx.HTTPTransport(retries=_CONNECT_RETRIES, **_tls_kwargs()),
         )
 
     def health(self) -> dict[str, Any]:
