@@ -68,33 +68,34 @@ _CLIENT_CERT_ENV = "COMPUTE_CLIENT_CERT"
 _CLIENT_KEY_ENV = "COMPUTE_CLIENT_KEY"
 
 
-def _tls_kwargs() -> dict[str, Any]:
-    """httpx TLS arguments from the environment, empty when none are set.
+def _tls_context() -> ssl.SSLContext | None:
+    """TLS material from the environment as one context, or `None` when none is set.
 
-    All three unset is a supported state, not a misconfiguration: it means default CA
-    verification and no client certificate, which is what a plain `http://tool:8000` call on
-    a host serving its own tools needs. Those must keep working untouched.
+    `None` is a supported state, not a misconfiguration: it means default CA verification and
+    no client certificate, which is what a plain `http://tool:8000` call on a host serving its
+    own tools needs. Those must keep working untouched.
+
+    A context rather than a `verify=` path plus a `cert=` pair because the two cannot be
+    combined on every client this is used with -- httpx 0.28 accepts the pair, httpx2 2.x
+    rejects it and demands exactly this -- and `websockets` wants a context regardless. One
+    shape works everywhere.
     """
     cert, key = os.environ.get(_CLIENT_CERT_ENV), os.environ.get(_CLIENT_KEY_ENV)
     if bool(cert) != bool(key):
         raise ValueError(f"set both {_CLIENT_CERT_ENV} and {_CLIENT_KEY_ENV}, or neither")
-    kwargs: dict[str, Any] = {}
-    if ca := os.environ.get(_CA_BUNDLE_ENV):
-        kwargs["verify"] = ca
-    if cert and key:
-        kwargs["cert"] = (cert, key)
-    return kwargs
-
-
-def _ws_ssl_context() -> ssl.SSLContext | None:
-    """The same material as `_tls_kwargs`, in the form `websockets` takes for a `wss://` URL."""
-    tls = _tls_kwargs()
-    if not tls:
+    ca = os.environ.get(_CA_BUNDLE_ENV)
+    if not ca and not cert:
         return None
-    context = ssl.create_default_context(cafile=tls.get("verify"))
-    if cert := tls.get("cert"):
-        context.load_cert_chain(*cert)
+    context = ssl.create_default_context(cafile=ca or None)
+    if cert and key:
+        context.load_cert_chain(cert, key)
     return context
+
+
+def _tls_kwargs() -> dict[str, Any]:
+    """`_tls_context` in the form httpx takes, empty when nothing is configured."""
+    context = _tls_context()
+    return {"verify": context} if context else {}
 
 
 @dataclass(frozen=True)
@@ -212,7 +213,11 @@ class ComputeServerClient:
 
         Unauthenticated — the one call that works without a valid token.
         """
-        return self._json(httpx.get(f"{self._base}/health", timeout=10.0, **_tls_kwargs()))
+        # A one-off client rather than `self._client`, to keep this the one call that carries no
+        # Authorization header -- and rather than `httpx.get`, whose top-level form does not
+        # accept `cert` and raises TypeError the moment a client certificate is configured.
+        with httpx.Client(timeout=10.0, **_tls_kwargs()) as client:
+            return self._json(client.get(f"{self._base}/health"))
 
     # ---- running something ------------------------------------------------------
 
@@ -367,7 +372,7 @@ class ComputeServerClient:
         with connect(
             ws_url,
             additional_headers={"Authorization": f"Bearer {self._token}"},
-            ssl=_ws_ssl_context() if scheme == "wss" else None,
+            ssl=_tls_context() if scheme == "wss" else None,
         ) as socket:
             while True:
                 try:

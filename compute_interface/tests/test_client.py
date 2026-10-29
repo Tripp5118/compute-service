@@ -278,17 +278,33 @@ def test_no_tls_material_configured_leaves_the_defaults_alone(monkeypatch):
     assert _tls_kwargs() == {}
 
 
-def test_tls_material_is_read_from_the_environment(monkeypatch):
-    from compute_interface.client import _tls_kwargs
+def test_tls_material_becomes_one_ssl_context(monkeypatch):
+    """A verify= path plus a cert= pair cannot be combined on every client this is used
+    with — httpx2 rejects it outright — so the three variables collapse into one context."""
+    import ssl as _ssl
 
+    from compute_interface import client as _client
+
+    seen = {}
+
+    class FakeContext:
+        def load_cert_chain(self, cert, key):
+            seen["chain"] = (cert, key)
+
+    def fake_default_context(cafile=None):
+        seen["cafile"] = cafile
+        return FakeContext()
+
+    monkeypatch.setattr(_ssl, "create_default_context", fake_default_context)
     monkeypatch.setenv("COMPUTE_CA_BUNDLE", "/etc/spark-lab/certs/ca.pem")
     monkeypatch.setenv("COMPUTE_CLIENT_CERT", "/etc/spark-lab/certs/client.pem")
     monkeypatch.setenv("COMPUTE_CLIENT_KEY", "/etc/spark-lab/certs/client-key.pem")
 
-    assert _tls_kwargs() == {
-        "verify": "/etc/spark-lab/certs/ca.pem",
-        "cert": ("/etc/spark-lab/certs/client.pem", "/etc/spark-lab/certs/client-key.pem"),
-    }
+    kwargs = _client._tls_kwargs()
+    assert seen["cafile"] == "/etc/spark-lab/certs/ca.pem"
+    assert seen["chain"] == ("/etc/spark-lab/certs/client.pem", "/etc/spark-lab/certs/client-key.pem")
+    assert set(kwargs) == {"verify"}, "cert= must not be passed alongside verify="
+    assert isinstance(kwargs["verify"], FakeContext)
 
 
 def test_half_a_client_certificate_is_an_error_rather_than_a_handshake_failure(monkeypatch):
@@ -364,3 +380,39 @@ def test_a_direct_http_base_still_streams_at_the_root(monkeypatch):
 
     assert dialled["url"] == "ws://materials-framework:8000/jobs/job-1/stream"
     assert dialled["ssl"] is None, "a plain ws:// stream must not be handed an SSL context"
+
+
+def test_health_works_when_a_client_certificate_is_configured(monkeypatch, tmp_path):
+    """`httpx.get` has no `cert` parameter, so building the health request through the
+    top-level helper raised TypeError as soon as a gateway client cert was set — breaking
+    the one call used to decide whether a tool is reachable at all."""
+    import httpx as _httpx
+
+    from compute_interface.client import ComputeServerClient
+
+    sentinel = object()
+    monkeypatch.setattr("compute_interface.client._tls_kwargs", lambda: {"verify": sentinel})
+
+    seen = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url):
+            seen["url"] = url
+            return _httpx.Response(200, json={"status": "ok"}, request=_httpx.Request("GET", url))
+
+    monkeypatch.setattr("compute_interface.client.httpx.Client", FakeClient)
+
+    client = ComputeServerClient("https://host:8443/materials-framework", "token")
+    assert client.health() == {"status": "ok"}
+    assert seen["verify"] is sentinel
+    assert "cert" not in seen
+    assert seen["url"] == "https://host:8443/materials-framework/health"
