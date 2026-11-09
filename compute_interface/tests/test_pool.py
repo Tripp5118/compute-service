@@ -174,3 +174,29 @@ def test_a_job_sent_without_a_timeout_gets_the_servers_default(tmp_path: Path, m
             assert client.jobs()["jobs"][0]["timeout_s"] == 86400
     finally:
         server.stop()
+
+
+def test_a_refusal_from_one_server_sends_the_job_to_another(two: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A machine on another build refuses what its neighbours accept.
+
+    Both stubs share one process, and a server reads RELEASE per request, so the older build's
+    refusal is made explicit here rather than by giving the two servers different releases.
+    """
+    from compute_interface import Refusal
+    from compute_interface import pool as pool_module
+
+    a, b = two
+    real_submit = pool_module.ComputeServerClient.submit
+
+    def old_build_on_a(client: Any, *args: Any, **kwargs: Any) -> str:
+        if client._base == a.url:
+            raise Refused(Refusal("agent_release_stale", "built from v1.0.0"))
+        return real_submit(client, *args, **kwargs)
+
+    monkeypatch.setattr(pool_module.ComputeServerClient, "submit", old_build_on_a)
+    with ComputeServerClient([a.url, b.url], TOKEN) as client:
+        accepted = client.wait(client.submit("def run():\n    return {'ok': 1}\n"), timeout_s=10)
+        assert accepted["provenance"]["server_url"] == b.url
+
+    with ComputeServerClient([a.url], TOKEN) as client, pytest.raises(Refused):
+        client.wait(client.submit("def run():\n    return {}\n"), timeout_s=10)

@@ -64,6 +64,7 @@ class _Job:
     status: str = "queued"
     outcome: dict[str, Any] | None = None
     refusal: Refused | None = None
+    refused_by: dict[str, Refused] = field(default_factory=dict)
     history: list[tuple[str, str]] = field(default_factory=list)
 
 
@@ -83,8 +84,8 @@ class PooledClient(ComputeServerClient):
         base_url: `pool://<tool>`, resolved through `COMPUTE_SERVER_POOLS`, or a list of URLs.
         token: Bearer token for every server that does not name its own `token_env`.
         timeout: Per-request timeout, as for one server.
-        agent_release: Sent with every job, as for one server. A server that refuses on it
-            makes `status`, `wait` and `run` raise `Refused` for that job.
+        agent_release: Sent with every job, as for one server. A job every server refuses makes
+            `status`, `wait` and `run` raise `Refused`; one server refusing sends it to another.
     """
 
     def __init__(
@@ -324,18 +325,39 @@ class PooledClient(ComputeServerClient):
                 self._fifo.appendleft(job)
 
     def _dispatch(self) -> None:
+        """Hand the front of the queue to an idle server, until one or the other runs out.
+
+        A refusal belongs to the server that gave it -- a machine on another build refuses what
+        its neighbours accept -- so the job is offered to the others first, and is refused for
+        good only once every server in the pool has said no.
+        """
         while True:
             with self._lock:
-                idle = [s for s in self._servers.values() if s.up and s.failing_since is None and not s.busy]
-                if not self._fifo or not idle:
+                if not self._fifo:
                     return
-                job, server = self._fifo.popleft(), idle[0]
+                job = self._fifo[0]
+                if self._servers and set(self._servers) <= set(job.refused_by):
+                    self._fifo.popleft()
+                    job.refusal = next(reversed(job.refused_by.values()))
+                    job.status = "failed"
+                    continue
+                idle = [
+                    s for s in self._servers.values()
+                    if s.up and s.failing_since is None and not s.busy and s.url not in job.refused_by
+                ]
+                if not idle:
+                    return
+                self._fifo.popleft()
+                server = idle[0]
                 server.busy = True
             try:
                 remote = ComputeServerClient.submit(server.client, **job.request)
             except Refused as exc:
-                job.refusal = exc
-                job.status = "failed"
+                logger.warning("compute pool: %s refused a job (%s); offering it elsewhere", server.url, exc)
+                with self._lock:
+                    server.busy = False
+                    job.refused_by[server.url] = exc
+                    self._fifo.appendleft(job)
                 continue
             except httpx.HTTPError as exc:
                 logger.warning("compute pool: submit to %s failed (%s); job stays first in line", server.url, exc)
