@@ -186,6 +186,15 @@ class ComputeServerClient:
             agent definition to be stale — a script, a smoke test.
     """
 
+    def __new__(cls, base_url: str | list[Any], *args: Any, **kwargs: Any) -> ComputeServerClient:
+        """A `pool://` name or a list of URLs gives a `PooledClient` with the same methods."""
+        if cls is ComputeServerClient:
+            from compute_interface.pool import PooledClient, is_pool
+
+            if is_pool(base_url):
+                return super().__new__(PooledClient)
+        return super().__new__(cls)
+
     def __init__(
         self,
         base_url: str,

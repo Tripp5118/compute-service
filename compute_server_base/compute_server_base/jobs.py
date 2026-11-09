@@ -78,6 +78,16 @@ def workspace_root() -> Path:
     return root
 
 
+def default_timeout_s() -> float | None:
+    """The limit a job gets when its caller sends none, from `COMPUTE_JOB_TIMEOUT_DEFAULT_S`.
+
+    Without one, a job that hangs holds the server's only worker until someone notices. Set per
+    tool in its compose file, because a sensible ceiling differs by hours between tools.
+    """
+    value = os.environ.get("COMPUTE_JOB_TIMEOUT_DEFAULT_S", "").strip()
+    return float(value) if value else None
+
+
 class JobStatus(str, Enum):  # noqa: UP042 — StrEnum needs 3.11; thermocalc's image is 3.10, see below
     """Lifecycle states a Job moves through, queued to one of three terminal states.
 
@@ -380,7 +390,7 @@ class JobManager:
             entrypoint=entrypoint or "run",
             variables=variables or {},
             correlation_id=correlation_id,
-            timeout_s=timeout_s,
+            timeout_s=timeout_s if timeout_s is not None else default_timeout_s(),
             workdir=workdir,
         )
         self._jobs[job.id] = job

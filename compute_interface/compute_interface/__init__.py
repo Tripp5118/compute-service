@@ -16,10 +16,12 @@ from compute_interface.client import (
     Refusal,
     Refused,
 )
+from compute_interface.pool import PooledClient
 
 __all__ = [
     "ComputeServerClient",
     "JobFailed",
+    "PooledClient",
     "Refusal",
     "Refused",
 ]

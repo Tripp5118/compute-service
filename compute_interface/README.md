@@ -72,9 +72,24 @@ sends that tag with every job; a server built from a different one refuses,
 rather than run real work under instructions already known to be wrong. Re-fetch
 the definition at the tag the server names and resubmit.
 
+## Several servers for one tool
+
+Pass a list of URLs, or `pool://<tool>` with `COMPUTE_SERVER_POOLS` naming a
+JSON file like `{"<tool>": ["http://a:8000", {"url": "https://b/x", "token_env": "B_TOKEN"}]}`.
+The same methods work. `submit` returns a handle at once; the pool hands each
+job to a server that has nothing queued or running, so the order you submit in
+is the order jobs start.
+
+A server that stops answering for `COMPUTE_POOL_DOWN_AFTER_S` (60) seconds has
+its unfinished jobs moved to the front of the queue; a job a restarted server no
+longer knows is moved the same way. It takes jobs again when it answers. The file
+is re-read when it changes, so a server added to it joins running clients. A job
+whose own code raised, or that hit its own `timeout_s`, is a result and is not
+rerun. `result()["provenance"]["server_url"]` says where a job ran.
+
 ## What it does not do
 
-No cost model, no scheduling, no retry policy, no opinion about which
+No cost model, no retry of a job that failed on its own, no opinion about which
 calculation is worth running. An instrument reports; the caller decides.
 
 It also asks no server what its tool can do. That question is answered by
