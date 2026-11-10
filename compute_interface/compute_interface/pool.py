@@ -21,10 +21,18 @@ when every member has said no.
 `COMPUTE_SERVER_POOLS` -- `{"<tool>": ["http://a:8000", {"url": "...", "token_env": "..."}]}` --
 and re-read whenever it changes, so a server added to the file takes new jobs from a campaign
 already running. A server that was down is tried again every time a job is placed.
+
+**A rerun finds its own jobs.** With `COMPUTE_POOL_JOURNAL` naming a file, every job placed is
+recorded there against its request -- the code, entrypoint, variables and timeout, and how many
+identical requests came before it. A caller that is killed and run again from the top submits
+the same requests in the same order if it is seeded, and each one is matched to the job already
+running or finished instead of being sent again. A request that matches nothing is new work; a
+matched job its server has since lost is resubmitted like any other.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -45,7 +53,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 POOLS_ENV = "COMPUTE_SERVER_POOLS"
+JOURNAL_ENV = "COMPUTE_POOL_JOURNAL"
 POOL_SCHEME = "pool://"
+
+#: Every pool in a process may share one journal file.
+_journal_lock = threading.Lock()
 
 
 def is_pool(base_url: Any) -> bool:
@@ -62,6 +74,7 @@ class _Job:
     status: str = "queued"
     outcome: dict[str, Any] | None = None
     history: list[tuple[str, str]] = field(default_factory=list)
+    slot: str = ""
 
 
 class PooledClient(ComputeServerClient):
@@ -99,6 +112,8 @@ class PooledClient(ComputeServerClient):
         self._failing_since: dict[str, float] = {}
         self._jobs: dict[str, _Job] = {}
         self._mtime: float | None = None
+        self._journal = os.environ.get(JOURNAL_ENV, "").strip() or None
+        self._seen: dict[str, int] = {}
         self._refresh()
 
     # ---- placing ----------------------------------------------------------------------
@@ -128,10 +143,44 @@ class PooledClient(ComputeServerClient):
                 "timeout_s": timeout_s,
             },
         )
-        self._place(job)
+        key = hashlib.sha256(
+            json.dumps([str(self._spec), job.request], sort_keys=True, default=str).encode()
+        ).hexdigest()
+        with self._lock:
+            job.slot = f"{key}:{self._seen.get(key, 0)}"
+            self._seen[key] = self._seen.get(key, 0) + 1
+        found = self._journal_read().get(job.slot)
+        if found and found[0] in self._members:
+            job.server, job.remote_id = found
+            logger.info("compute pool: found job %s on %s from an earlier run", found[1], found[0])
+        else:
+            self._place(job)
         with self._lock:
             self._jobs[job.handle] = job
         return job.handle
+
+    def _journal_read(self) -> dict[str, list[str]]:
+        if not self._journal:
+            return {}
+        with _journal_lock:
+            try:
+                return dict(json.loads(Path(self._journal).read_text()))
+            except (OSError, ValueError):
+                return {}
+
+    def _journal_write(self, job: _Job) -> None:
+        if not (self._journal and job.slot):
+            return
+        with _journal_lock:
+            path = Path(self._journal)
+            try:
+                entries = dict(json.loads(path.read_text()))
+            except (OSError, ValueError):
+                entries = {}
+            entries[job.slot] = [job.server, job.remote_id]
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(entries))
+            tmp.replace(path)
 
     def _place(self, job: _Job, avoid: str | None = None) -> None:
         """Submit to the member with the shortest queue; on a refusal, to the next one.
@@ -165,6 +214,7 @@ class PooledClient(ComputeServerClient):
                 job.history.append((job.server, job.remote_id))
             job.server, job.remote_id, job.status = url, remote, "queued"
             self._failing_since.pop(url, None)
+            self._journal_write(job)
             return
         if refusal is not None:
             raise refusal

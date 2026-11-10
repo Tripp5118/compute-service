@@ -89,6 +89,11 @@ raised, or that hit its own `timeout_s`, is a result and is not rerun. A refusal
 from one server sends the job to the next; `Refused` is raised only when every
 server refuses. `result()["provenance"]["server_url"]` says where a job ran.
 
+Set `COMPUTE_POOL_JOURNAL` to a file and a caller that is killed and run again
+finds its own jobs: each request is recorded with how many identical ones came
+before it, and a rerun that makes the same requests in the same order gets the
+jobs already running or finished instead of sending them again.
+
 ## What it does not do
 
 No cost model, no retry of a job that failed on its own, no opinion about which

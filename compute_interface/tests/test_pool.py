@@ -224,3 +224,33 @@ def test_a_job_behind_the_one_being_waited_on_moves_without_being_polled(two: An
         client.wait(first, timeout_s=30, poll_s=0.1)
         assert client._jobs[behind].history, "the job on the dead server was not moved while waiting on another"
         assert client.wait(behind, timeout_s=30)["values"] == {"tag": "behind"}
+
+
+def test_a_rerun_finds_the_jobs_its_first_run_submitted(two: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A campaign killed and started again submits the same requests; none is sent twice."""
+    a, b = two
+    monkeypatch.setenv("COMPUTE_POOL_JOURNAL", str(tmp_path / "journal.json"))
+    first_run = ComputeServerClient([a.url, b.url], TOKEN)
+    for tag in ("x", "x", "y"):
+        first_run.submit(SLEEP, variables={"t": 1, "tag": tag})
+    del first_run  # killed without waiting
+
+    with ComputeServerClient([a.url, b.url], TOKEN) as rerun:
+        handles = [rerun.submit(SLEEP, variables={"t": 1, "tag": tag}) for tag in ("x", "x", "y")]
+        assert [rerun.wait(h, timeout_s=20)["values"]["tag"] for h in handles] == ["x", "x", "y"]
+        fresh = rerun.submit(SLEEP, variables={"t": 0, "tag": "new"})
+        rerun.wait(fresh, timeout_s=20)
+    assert len(a.remote_ids_oldest_first()) + len(b.remote_ids_oldest_first()) == 4
+
+
+def test_a_found_job_its_server_has_since_lost_is_sent_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    only = Stub(tmp_path / "only").start()
+    monkeypatch.setenv("COMPUTE_POOL_JOURNAL", str(tmp_path / "journal.json"))
+    try:
+        ComputeServerClient([only.url], TOKEN).submit(SLEEP, variables={"t": 0, "tag": "z"})
+        only.stop()
+        only.start()
+        with ComputeServerClient([only.url], TOKEN) as rerun:
+            assert rerun.wait(rerun.submit(SLEEP, variables={"t": 0, "tag": "z"}), timeout_s=20)["values"] == {"tag": "z"}
+    finally:
+        only.stop()
