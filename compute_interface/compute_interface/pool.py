@@ -6,7 +6,8 @@ returns a `PooledClient`. A caller's code does not change: `submit` returns a ha
 
 **The servers hold the queues; the pool only places and watches.** `submit` sends the job at
 once to the member with the fewest jobs queued or running. After that the pool looks at the job
-only when the caller does -- every `status`, and so every poll of `wait`.
+only when the caller does: every `status`, and so every poll of `wait`, checks that job and, at
+most every 30 s, every server holding another of this client's unfinished jobs.
 
 **Only a server going away moves a job.** A server that has not answered for
 `COMPUTE_POOL_DOWN_AFTER_S` (60 s) has its job resubmitted to another member; a job a restarted
@@ -87,6 +88,9 @@ class PooledClient(ComputeServerClient):
         self._timeout = timeout
         self._agent_release = agent_release
         self._down_after = float(os.environ.get("COMPUTE_POOL_DOWN_AFTER_S", "60"))
+        self._sweep_s = float(os.environ.get("COMPUTE_POOL_SWEEP_S", "30"))
+        self._last_sweep = 0.0
+        self._sweeping = threading.Lock()
         self._lock = threading.RLock()
         #: Every member a job may still be on. A member removed from the file stays here, so a
         #: job running on it is still readable, but is no longer in `_offered`.
@@ -171,40 +175,78 @@ class PooledClient(ComputeServerClient):
     def status(self, job_id: str) -> str:
         """Ask the job's server; move the job if that server has gone."""
         job = self._job(job_id)
+        self._sweep()
         if job.outcome is not None:
             return job.status
-        client = self._members[job.server or ""]
+        server, remote = job.server or "", job.remote_id
+        client = self._members[server]
         try:
-            status = client._json(client._client.get(f"/jobs/{job.remote_id}"))["status"]
+            status = client._json(client._client.get(f"/jobs/{remote}"))["status"]
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 raise
-            logger.warning("compute pool: %s no longer knows job %s; resubmitting", job.server, job.remote_id)
-            self._move(job)
+            self._move(job, remote, f"{server} no longer knows job {remote}")
             return job.status
         except (httpx.HTTPError, ValueError):
-            since = self._failing_since.setdefault(job.server or "", time.monotonic())
-            if time.monotonic() - since >= self._down_after:
-                logger.warning(
-                    "compute pool: %s has not answered for %.0f s; resubmitting job %s elsewhere",
-                    job.server, time.monotonic() - since, job.handle,
-                )
-                self._move(job)
+            if self._down(server):
+                self._move(job, remote, f"{server} has not answered for {self._down_after:.0f} s")
             return job.status
-        self._failing_since.pop(job.server or "", None)
+        self._failing_since.pop(server, None)
         if status in _TERMINAL:
-            outcome = client.result(job.remote_id or "")
-            outcome.setdefault("provenance", {})["server_url"] = job.server
+            outcome = client.result(remote or "")
+            outcome.setdefault("provenance", {})["server_url"] = server
             job.outcome = outcome
         job.status = status
         return status
 
-    def _move(self, job: _Job) -> None:
-        """Resubmit a job its server lost. If nothing can take it now, try again next poll."""
+    def _sweep(self) -> None:
+        """Check every server holding one of this client's unfinished jobs, not only the polled one.
+
+        A caller that waits on its jobs one after another polls only the first until it ends; on
+        hours-long jobs, a job behind it whose server died would otherwise wait those hours to be
+        noticed. One `/jobs` per server, at most every `COMPUTE_POOL_SWEEP_S` (30) seconds.
+        """
+        if not self._sweeping.acquire(blocking=False):
+            return
         try:
-            self._place(job, avoid=job.server)
-        except httpx.ConnectError:
-            logger.warning("compute pool: nowhere to move job %s yet", job.handle)
+            if time.monotonic() - self._last_sweep < self._sweep_s:
+                return
+            self._last_sweep = time.monotonic()
+            placed: dict[str, list[tuple[_Job, str | None]]] = {}
+            for job in list(self._jobs.values()):
+                if job.outcome is None and job.server:
+                    placed.setdefault(job.server, []).append((job, job.remote_id))
+            for url, jobs in placed.items():
+                client = self._members[url]
+                try:
+                    payload = client._json(client._client.get("/jobs", timeout=10.0))
+                except (httpx.HTTPError, ValueError):
+                    if self._down(url):
+                        for job, remote in jobs:
+                            self._move(job, remote, f"{url} has not answered for {self._down_after:.0f} s")
+                    continue
+                self._failing_since.pop(url, None)
+                known = {entry.get("job_id") for entry in payload.get("jobs", [])}
+                for job, remote in jobs:
+                    if remote not in known:
+                        self._move(job, remote, f"{url} no longer knows job {remote}")
+        finally:
+            self._sweeping.release()
+
+    def _down(self, url: str) -> bool:
+        since = self._failing_since.setdefault(url, time.monotonic())
+        return time.monotonic() - since >= self._down_after
+
+    def _move(self, job: _Job, lost: str | None, why: str) -> None:
+        """Resubmit a job its server lost, once. If nothing can take it now, try again next poll."""
+        with self._lock:
+            if job.remote_id != lost or job.outcome is not None:
+                return
+            logger.warning("compute pool: %s; resubmitting job %s", why, job.handle)
+            try:
+                self._place(job, avoid=job.server)
+            except httpx.ConnectError:
+                logger.warning("compute pool: nowhere to move job %s yet", job.handle)
 
     def result(self, job_id: str) -> dict[str, Any]:
         """The finished job's result, with `provenance.server_url` naming the server that ran it."""

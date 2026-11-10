@@ -71,6 +71,7 @@ def _until(predicate: Any, seconds: float) -> None:
 @pytest.fixture(autouse=True)
 def _fast_pool(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("COMPUTE_POOL_DOWN_AFTER_S", "0.5")
+    monkeypatch.setenv("COMPUTE_POOL_SWEEP_S", "0.2")
 
 
 @pytest.fixture
@@ -208,3 +209,18 @@ def test_a_server_that_restarts_and_forgets_a_job_gets_it_again_when_it_is_the_o
         assert len(client._jobs[handle].history) == 1
     finally:
         only.stop()
+
+
+def test_a_job_behind_the_one_being_waited_on_moves_without_being_polled(two: Any) -> None:
+    """A caller waiting on its jobs in order polls only the first; the rest must still move."""
+    a, b = two
+    with ComputeServerClient([a.url, b.url], TOKEN) as client:
+        first = client.submit(SLEEP, variables={"t": 3, "tag": "first"})
+        behind = client.submit(SLEEP, variables={"t": 1, "tag": "behind"})
+        doomed = a if client._jobs[behind].server == a.url else b
+        doomed.stop()
+        if client._jobs[first].server == doomed.url:
+            pytest.skip("both jobs landed on one server")
+        client.wait(first, timeout_s=30, poll_s=0.1)
+        assert client._jobs[behind].history, "the job on the dead server was not moved while waiting on another"
+        assert client.wait(behind, timeout_s=30)["values"] == {"tag": "behind"}
