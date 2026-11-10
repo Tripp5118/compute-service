@@ -130,21 +130,24 @@ class PooledClient(ComputeServerClient):
         return job.handle
 
     def _place(self, job: _Job, avoid: str | None = None) -> None:
-        """Submit to the member with the shortest queue; on a refusal, to the next one."""
+        """Submit to the member with the shortest queue; on a refusal, to the next one.
+
+        `avoid` is the member that just lost the job. It is tried last rather than skipped: a
+        server that restarted is healthy again, and may be the only one there is.
+        """
         self._refresh()
         loads = []
         for url in list(self._offered):
-            if url == avoid:
-                continue
             client = self._members[url]
             try:
                 payload = client._json(client._client.get("/jobs"))
             except (httpx.HTTPError, ValueError):
                 continue
             if payload.get("worker_alive", True):
-                loads.append((int(payload.get("queued", 0)) + int(payload.get("running", 0)), url))
+                load = int(payload.get("queued", 0)) + int(payload.get("running", 0))
+                loads.append((url == avoid, load, url))
         refusal: Refused | None = None
-        for _, url in sorted(loads):
+        for _, _, url in sorted(loads):
             try:
                 remote = ComputeServerClient.submit(self._members[url], **job.request)
             except Refused as exc:

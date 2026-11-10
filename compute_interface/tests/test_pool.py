@@ -194,3 +194,17 @@ def test_a_refusal_from_one_server_sends_the_job_to_another(two: Any, monkeypatc
 
     with ComputeServerClient([a.url], TOKEN) as client, pytest.raises(Refused):
         client.submit("def run():\n    return {}\n")
+
+
+def test_a_server_that_restarts_and_forgets_a_job_gets_it_again_when_it_is_the_only_one(tmp_path: Path) -> None:
+    only = Stub(tmp_path / "only").start()
+    try:
+        with ComputeServerClient([only.url], TOKEN) as client:
+            handle = client.submit(SLEEP, variables={"t": 2, "tag": "again"})
+            only.stop()
+            only.start()
+            outcome = client.wait(handle, timeout_s=20, poll_s=0.1)
+        assert outcome["values"] == {"tag": "again"}
+        assert len(client._jobs[handle].history) == 1
+    finally:
+        only.stop()
