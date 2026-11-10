@@ -4,28 +4,26 @@
 returns a `PooledClient`. A caller's code does not change: `submit` returns a handle, and
 `status`, `wait`, `result`, `run`, `files`, `fetch`, `stream`, `cancel` and `discard` take it.
 
-**The pool holds the queue, not the servers.** A server is handed a job only when it has
-nothing queued or running, so the pool's own FIFO decides what runs next. That is what lets a
-job from a server that went down go to the front: if the servers held the queue, a requeued job
-would land behind whatever they already had.
+**The servers hold the queues; the pool only places and watches.** `submit` sends the job at
+once to the member with the fewest jobs queued or running. After that the pool looks at the job
+only when the caller does -- every `status`, and so every poll of `wait`.
 
-**Only a server going away requeues a job.** A server that stops answering for
-`COMPUTE_POOL_DOWN_AFTER_S` (60 s), or reports its worker dead, is marked down and its
-unfinished jobs go back to the front of the FIFO. A job that comes back 404 was lost by a
-server that restarted, and is requeued the same way. A job whose own code raised, or that hit
-its own `timeout_s`, is a result: it would fail the same way anywhere, and rerunning a
-day-long job for a typo costs a day.
+**Only a server going away moves a job.** A server that has not answered for
+`COMPUTE_POOL_DOWN_AFTER_S` (60 s) has its job resubmitted to another member; a job a restarted
+server no longer knows (404) is resubmitted at once. A job whose own code raised, or that hit its
+own `timeout_s`, is a result: it would fail the same way anywhere, and rerunning a day-long job
+for a typo costs a day. A refusal belongs to the refusing server (a machine on another build
+refuses what its neighbours accept), so the job is offered to the others and is refused only
+when every member has said no.
 
 **Membership is live.** `pool://<tool>` is read from the JSON file named by
-`COMPUTE_SERVER_POOLS` — `{"<tool>": ["http://a:8000", {"url": "...", "token_env": "..."}]}` —
-and re-read when it changes, so a server added to the file starts taking jobs from a campaign
-that is already running. A down server is probed every tick and takes jobs again once it
-answers. A job abandoned on it is cancelled there when it returns, in case it was still running.
+`COMPUTE_SERVER_POOLS` -- `{"<tool>": ["http://a:8000", {"url": "...", "token_env": "..."}]}` --
+and re-read whenever it changes, so a server added to the file takes new jobs from a campaign
+already running. A server that was down is tried again every time a job is placed.
 """
 
 from __future__ import annotations
 
-import collections
 import json
 import logging
 import os
@@ -57,24 +55,12 @@ def is_pool(base_url: Any) -> bool:
 @dataclass
 class _Job:
     handle: str
-    seq: int
     request: dict[str, Any]
     server: str | None = None
     remote_id: str | None = None
     status: str = "queued"
     outcome: dict[str, Any] | None = None
-    refusal: Refused | None = None
-    refused_by: dict[str, Refused] = field(default_factory=dict)
     history: list[tuple[str, str]] = field(default_factory=list)
-
-
-@dataclass
-class _Server:
-    url: str
-    client: ComputeServerClient
-    up: bool = True
-    failing_since: float | None = None
-    busy: bool = False
 
 
 class PooledClient(ComputeServerClient):
@@ -84,8 +70,7 @@ class PooledClient(ComputeServerClient):
         base_url: `pool://<tool>`, resolved through `COMPUTE_SERVER_POOLS`, or a list of URLs.
         token: Bearer token for every server that does not name its own `token_env`.
         timeout: Per-request timeout, as for one server.
-        agent_release: Sent with every job, as for one server. A job every server refuses makes
-            `status`, `wait` and `run` raise `Refused`; one server refusing sends it to another.
+        agent_release: Sent with every job, as for one server.
     """
 
     def __init__(
@@ -96,26 +81,23 @@ class PooledClient(ComputeServerClient):
         timeout: float = 30.0,
         agent_release: str | None = None,
     ) -> None:
-        """Resolve the members and start the dispatcher thread."""
+        """Resolve the members; nothing is contacted until a job is placed."""
         self._spec = base_url
         self._token = token
         self._timeout = timeout
         self._agent_release = agent_release
         self._down_after = float(os.environ.get("COMPUTE_POOL_DOWN_AFTER_S", "60"))
-        self._tick_s = float(os.environ.get("COMPUTE_POOL_TICK_S", "2"))
         self._lock = threading.RLock()
-        self._servers: dict[str, _Server] = {}
-        self._fifo: collections.deque[_Job] = collections.deque()
+        #: Every member a job may still be on. A member removed from the file stays here, so a
+        #: job running on it is still readable, but is no longer in `_offered`.
+        self._members: dict[str, ComputeServerClient] = {}
+        self._offered: list[str] = []
+        self._failing_since: dict[str, float] = {}
         self._jobs: dict[str, _Job] = {}
-        self._abandoned: dict[str, list[str]] = collections.defaultdict(list)
-        self._seq = 0
         self._mtime: float | None = None
-        self._closed = threading.Event()
-        self._refresh_members()
-        self._thread = threading.Thread(target=self._loop, name="compute-pool", daemon=True)
-        self._thread.start()
+        self._refresh()
 
-    # ---- the caller's side --------------------------------------------------------
+    # ---- placing ----------------------------------------------------------------------
 
     def submit(
         self,
@@ -126,92 +108,146 @@ class PooledClient(ComputeServerClient):
         correlation_id: str | None = None,
         timeout_s: float | None = None,
     ) -> str:
-        """Queue a job in the pool and return its handle immediately."""
+        """Send the job to the least-loaded member now and return its handle.
+
+        Raises:
+            Refused: Every member refused it.
+            httpx.ConnectError: No member could be reached.
+        """
+        job = _Job(
+            handle=f"pool-{uuid.uuid4().hex}",
+            request={
+                "code": code,
+                "entrypoint": entrypoint,
+                "variables": variables,
+                "correlation_id": correlation_id,
+                "timeout_s": timeout_s,
+            },
+        )
+        self._place(job)
         with self._lock:
-            self._seq += 1
-            job = _Job(
-                handle=f"pool-{uuid.uuid4().hex}",
-                seq=self._seq,
-                request={
-                    "code": code,
-                    "entrypoint": entrypoint,
-                    "variables": variables,
-                    "correlation_id": correlation_id,
-                    "timeout_s": timeout_s,
-                },
-            )
             self._jobs[job.handle] = job
-            self._fifo.append(job)
         return job.handle
 
+    def _place(self, job: _Job, avoid: str | None = None) -> None:
+        """Submit to the member with the shortest queue; on a refusal, to the next one."""
+        self._refresh()
+        loads = []
+        for url in list(self._offered):
+            if url == avoid:
+                continue
+            client = self._members[url]
+            try:
+                payload = client._json(client._client.get("/jobs"))
+            except (httpx.HTTPError, ValueError):
+                continue
+            if payload.get("worker_alive", True):
+                loads.append((int(payload.get("queued", 0)) + int(payload.get("running", 0)), url))
+        refusal: Refused | None = None
+        for _, url in sorted(loads):
+            try:
+                remote = ComputeServerClient.submit(self._members[url], **job.request)
+            except Refused as exc:
+                logger.warning("compute pool: %s refused a job (%s); offering it elsewhere", url, exc)
+                refusal = exc
+                continue
+            except httpx.HTTPError as exc:
+                logger.warning("compute pool: submit to %s failed (%s); trying another", url, exc)
+                continue
+            if job.server and job.remote_id:
+                job.history.append((job.server, job.remote_id))
+            job.server, job.remote_id, job.status = url, remote, "queued"
+            self._failing_since.pop(url, None)
+            return
+        if refusal is not None:
+            raise refusal
+        raise httpx.ConnectError(f"no server in {self._spec} could take the job")
+
+    # ---- watching ---------------------------------------------------------------------
+
     def status(self, job_id: str) -> str:
-        """queued (in the pool or on a server), running, succeeded, failed or cancelled."""
+        """Ask the job's server; move the job if that server has gone."""
         job = self._job(job_id)
-        if job.refusal is not None:
-            raise job.refusal
-        return job.status
+        if job.outcome is not None:
+            return job.status
+        client = self._members[job.server or ""]
+        try:
+            status = client._json(client._client.get(f"/jobs/{job.remote_id}"))["status"]
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code != 404:
+                raise
+            logger.warning("compute pool: %s no longer knows job %s; resubmitting", job.server, job.remote_id)
+            self._move(job)
+            return job.status
+        except (httpx.HTTPError, ValueError):
+            since = self._failing_since.setdefault(job.server or "", time.monotonic())
+            if time.monotonic() - since >= self._down_after:
+                logger.warning(
+                    "compute pool: %s has not answered for %.0f s; resubmitting job %s elsewhere",
+                    job.server, time.monotonic() - since, job.handle,
+                )
+                self._move(job)
+            return job.status
+        self._failing_since.pop(job.server or "", None)
+        if status in _TERMINAL:
+            outcome = client.result(job.remote_id or "")
+            outcome.setdefault("provenance", {})["server_url"] = job.server
+            job.outcome = outcome
+        job.status = status
+        return status
+
+    def _move(self, job: _Job) -> None:
+        """Resubmit a job its server lost. If nothing can take it now, try again next poll."""
+        try:
+            self._place(job, avoid=job.server)
+        except httpx.ConnectError:
+            logger.warning("compute pool: nowhere to move job %s yet", job.handle)
 
     def result(self, job_id: str) -> dict[str, Any]:
         """The finished job's result, with `provenance.server_url` naming the server that ran it."""
         job = self._job(job_id)
-        if job.refusal is not None:
-            raise job.refusal
         if job.outcome is not None:
             return job.outcome
-        server, remote = self._placed(job)
-        return server.client.result(remote)
+        return self._members[job.server or ""].result(job.remote_id or "")
 
     def cancel(self, job_id: str) -> bool:
-        """Drop a job still in the pool, or cancel it on the server running it."""
+        """Cancel the job on the server holding it."""
         job = self._job(job_id)
-        with self._lock:
-            if job in self._fifo:
-                self._fifo.remove(job)
-                job.status = "cancelled"
-                job.outcome = {"values": None, "error": "cancelled before it was dispatched", "files": []}
-                return True
-        if job.status in _TERMINAL:
-            return False
-        server, remote = self._placed(job)
-        return server.client.cancel(remote)
+        return self._members[job.server or ""].cancel(job.remote_id or "")
 
     def stream(self, job_id: str) -> Iterator[dict[str, Any]]:
-        """The log of the server running the job; waits for it to be dispatched first."""
+        """The log of the server holding the job."""
         job = self._job(job_id)
-        while job.server is None and job.status not in _TERMINAL and job.refusal is None:
-            time.sleep(self._tick_s)
-        if job.server is None:
-            return iter(())
-        server, remote = self._placed(job)
-        return server.client.stream(remote)
+        return self._members[job.server or ""].stream(job.remote_id or "")
 
     def files(self, job_id: str) -> list[dict[str, Any]]:
         """The workspace manifest on the server that ran the job."""
-        server, remote = self._placed(self._job(job_id))
-        return server.client.files(remote)
+        job = self._job(job_id)
+        return self._members[job.server or ""].files(job.remote_id or "")
 
     def fetch(self, job_id: str, path: str, dest: str | Path) -> Path:
         """One file out of the workspace on the server that ran the job."""
-        server, remote = self._placed(self._job(job_id))
-        return server.client.fetch(remote, path, dest)
+        job = self._job(job_id)
+        return self._members[job.server or ""].fetch(job.remote_id or "", path, dest)
 
     def archive(self, job_id: str, dest: str | Path) -> Path:
         """The workspace on the server that ran the job, as one tar.gz."""
-        server, remote = self._placed(self._job(job_id))
-        return server.client.archive(remote, dest)
+        job = self._job(job_id)
+        return self._members[job.server or ""].archive(job.remote_id or "", dest)
 
     def discard(self, job_id: str) -> None:
         """Delete the workspace on the server that ran the job."""
-        server, remote = self._placed(self._job(job_id))
-        server.client.discard(remote)
+        job = self._job(job_id)
+        self._members[job.server or ""].discard(job.remote_id or "")
 
     def health(self) -> dict[str, Any]:
         """Each member's `/health`, and `ok` if any of them answers."""
+        self._refresh()
         members: dict[str, Any] = {}
-        for url, server in list(self._servers.items()):
+        for url in list(self._offered):
             try:
-                members[url] = server.client.health()
-            except httpx.HTTPError as exc:
+                members[url] = self._members[url].health()
+            except (httpx.HTTPError, ValueError) as exc:
                 members[url] = {"status": "unreachable", "error": str(exc)}
         answering = [m for m in members.values() if m.get("status") == "ok"]
         first = answering[0] if answering else {}
@@ -223,154 +259,34 @@ class PooledClient(ComputeServerClient):
         }
 
     def jobs(self) -> dict[str, Any]:
-        """What the pool holds and where each member stands."""
-        with self._lock:
-            return {
-                "worker_alive": any(s.up for s in self._servers.values()),
-                "pending_in_pool": len(self._fifo),
-                "servers": {
-                    url: {"up": s.up, "busy": s.busy, "failing": s.failing_since is not None}
-                    for url, s in self._servers.items()
-                },
-                "jobs": [
-                    {"handle": j.handle, "status": j.status, "server": j.server, "requeued": len(j.history)}
-                    for j in self._jobs.values()
-                ],
-            }
+        """Every member's own queue, and where each of this client's jobs is."""
+        self._refresh()
+        servers: dict[str, Any] = {}
+        for url in list(self._offered):
+            client = self._members[url]
+            try:
+                payload = client._json(client._client.get("/jobs"))
+                servers[url] = {k: payload.get(k) for k in ("worker_alive", "queued", "running")}
+            except (httpx.HTTPError, ValueError) as exc:
+                servers[url] = {"worker_alive": False, "error": str(exc)}
+        return {
+            "worker_alive": any(s.get("worker_alive") for s in servers.values()),
+            "servers": servers,
+            "jobs": [
+                {"handle": j.handle, "status": j.status, "server": j.server, "moved": len(j.history)}
+                for j in self._jobs.values()
+            ],
+        }
 
     def close(self) -> None:
-        """Stop dispatching and close every member's connection pool."""
-        self._closed.set()
-        self._thread.join(timeout=self._tick_s + 5)
-        for server in self._servers.values():
-            server.client.close()
+        """Close every member's connection pool."""
+        for client in self._members.values():
+            client.close()
 
-    # ---- the dispatcher -------------------------------------------------------------
+    # ---- membership -------------------------------------------------------------------
 
-    def _loop(self) -> None:
-        while not self._closed.is_set():
-            try:
-                self._tick()
-            except Exception:  # noqa: BLE001 — the dispatcher must outlive any one bad tick
-                logger.exception("compute pool tick failed")
-            self._closed.wait(self._tick_s)
-
-    def _tick(self) -> None:
-        self._refresh_members()
-        now = time.monotonic()
-        for server in list(self._servers.values()):
-            self._probe(server, now)
-        for job in [j for j in self._jobs.values() if j.server and j.status not in _TERMINAL]:
-            self._follow(job)
-        self._dispatch()
-
-    def _probe(self, server: _Server, now: float) -> None:
-        """Mark a member busy, idle, failing or down from one unretried `/jobs`."""
-        try:
-            payload = server.client._json(server.client._client.get("/jobs"))
-            alive = bool(payload.get("worker_alive", True))
-        except (httpx.HTTPError, ValueError):
-            alive = False
-            payload = {}
-        if alive:
-            server.busy = bool(payload.get("queued") or payload.get("running"))
-            server.failing_since = None
-            if not server.up:
-                server.up = True
-                logger.warning("compute pool: %s answers again and takes jobs", server.url)
-                for remote in self._abandoned.pop(server.url, []):
-                    try:
-                        server.client.cancel(remote)
-                    except httpx.HTTPError:
-                        pass
-            return
-        if server.failing_since is None:
-            server.failing_since = now
-        if server.up and now - server.failing_since >= self._down_after:
-            server.up = False
-            stranded = [j for j in self._jobs.values() if j.server == server.url and j.status not in _TERMINAL]
-            logger.warning(
-                "compute pool: %s has not answered for %.0f s; %d job(s) go to the front of the queue",
-                server.url, now - server.failing_since, len(stranded),
-            )
-            self._requeue(stranded)
-
-    def _follow(self, job: _Job) -> None:
-        server = self._servers.get(job.server or "")
-        if server is None or not server.up:
-            return
-        try:
-            status = server.client._json(server.client._client.get(f"/jobs/{job.remote_id}"))["status"]
-            if status in _TERMINAL:
-                outcome = server.client.result(job.remote_id or "")
-                outcome.setdefault("provenance", {})["server_url"] = server.url
-                job.outcome = outcome
-        except httpx.HTTPStatusError as exc:
-            if exc.response.status_code == 404:
-                logger.warning("compute pool: %s no longer knows job %s; requeued", server.url, job.remote_id)
-                self._requeue([job])
-            return
-        except httpx.HTTPError:
-            return
-        job.status = status
-
-    def _requeue(self, jobs: list[_Job]) -> None:
-        with self._lock:
-            for job in sorted(jobs, key=lambda j: j.seq, reverse=True):
-                if job.server and job.remote_id:
-                    job.history.append((job.server, job.remote_id))
-                    self._abandoned[job.server].append(job.remote_id)
-                job.server = job.remote_id = None
-                job.status = "queued"
-                self._fifo.appendleft(job)
-
-    def _dispatch(self) -> None:
-        """Hand the front of the queue to an idle server, until one or the other runs out.
-
-        A refusal belongs to the server that gave it -- a machine on another build refuses what
-        its neighbours accept -- so the job is offered to the others first, and is refused for
-        good only once every server in the pool has said no.
-        """
-        while True:
-            with self._lock:
-                if not self._fifo:
-                    return
-                job = self._fifo[0]
-                if self._servers and set(self._servers) <= set(job.refused_by):
-                    self._fifo.popleft()
-                    job.refusal = next(reversed(job.refused_by.values()))
-                    job.status = "failed"
-                    continue
-                idle = [
-                    s for s in self._servers.values()
-                    if s.up and s.failing_since is None and not s.busy and s.url not in job.refused_by
-                ]
-                if not idle:
-                    return
-                self._fifo.popleft()
-                server = idle[0]
-                server.busy = True
-            try:
-                remote = ComputeServerClient.submit(server.client, **job.request)
-            except Refused as exc:
-                logger.warning("compute pool: %s refused a job (%s); offering it elsewhere", server.url, exc)
-                with self._lock:
-                    server.busy = False
-                    job.refused_by[server.url] = exc
-                    self._fifo.appendleft(job)
-                continue
-            except httpx.HTTPError as exc:
-                logger.warning("compute pool: submit to %s failed (%s); job stays first in line", server.url, exc)
-                with self._lock:
-                    server.failing_since = server.failing_since or time.monotonic()
-                    self._fifo.appendleft(job)
-                continue
-            job.server, job.remote_id = server.url, remote
-
-    # ---- membership -----------------------------------------------------------------
-
-    def _members(self) -> list[tuple[str, str]]:
-        """(url, token) for every member the spec names right now."""
+    def _wanted(self) -> dict[str, str]:
+        """{url: token} for every member the spec names right now."""
         if isinstance(self._spec, (list, tuple)):
             entries = list(self._spec)
         else:
@@ -382,59 +298,46 @@ class PooledClient(ComputeServerClient):
             if name not in pools:
                 raise KeyError(f"{POOLS_ENV} file {path} has no pool {name!r}; it has {sorted(pools)}")
             entries = list(pools[name])
-        members = []
+        wanted = {}
         for entry in entries:
             if isinstance(entry, str):
-                members.append((entry.rstrip("/"), self._token))
+                wanted[entry.rstrip("/")] = self._token
             else:
                 token = os.environ.get(entry["token_env"], "") if entry.get("token_env") else self._token
-                members.append((str(entry["url"]).rstrip("/"), token))
-        return members
+                wanted[str(entry["url"]).rstrip("/")] = token
+        return wanted
 
-    def _refresh_members(self) -> None:
-        if not isinstance(self._spec, (list, tuple)):
+    def _refresh(self) -> None:
+        if isinstance(self._spec, (list, tuple)):
+            if self._offered:
+                return
+        else:
             path = Path(os.environ.get(POOLS_ENV, ""))
             mtime = path.stat().st_mtime if path.is_file() else None
-            if self._mtime is not None and mtime == self._mtime:
+            if self._offered and mtime == self._mtime:
                 return
             self._mtime = mtime
-        elif self._servers:
-            return
         try:
-            wanted = dict(self._members())
+            wanted = self._wanted()
         except (OSError, ValueError, KeyError):
-            if not self._servers:
+            if not self._offered:
                 raise
             logger.exception("compute pool: could not re-read %s; keeping the current members", POOLS_ENV)
             return
         with self._lock:
-            for url in [u for u in self._servers if u not in wanted]:
-                gone = self._servers.pop(url)
-                logger.warning("compute pool: %s left the pool", url)
-                self._requeue([j for j in self._jobs.values() if j.server == url and j.status not in _TERMINAL])
-                gone.client.close()
             for url, token in wanted.items():
-                if url not in self._servers:
-                    self._servers[url] = _Server(
-                        url=url,
-                        client=ComputeServerClient(
-                            url, token, timeout=self._timeout, agent_release=self._agent_release
-                        ),
+                if url not in self._members:
+                    self._members[url] = ComputeServerClient(
+                        url, token, timeout=self._timeout, agent_release=self._agent_release
                     )
-                    logger.info("compute pool: %s joined", url)
+            for url in set(self._offered) - set(wanted):
+                logger.warning("compute pool: %s left the pool; it takes no new jobs", url)
+            self._offered = list(wanted)
 
-    # ---- plumbing -------------------------------------------------------------------
+    # ---- plumbing ---------------------------------------------------------------------
 
     def _job(self, handle: str) -> _Job:
         try:
             return self._jobs[handle]
         except KeyError:
             raise KeyError(f"no job {handle!r} in this pool") from None
-
-    def _placed(self, job: _Job) -> tuple[_Server, str]:
-        if job.server is None or job.remote_id is None:
-            raise RuntimeError(f"job {job.handle} has not been dispatched to a server yet")
-        server = self._servers.get(job.server)
-        if server is None:
-            raise RuntimeError(f"job {job.handle} ran on {job.server}, which has left the pool")
-        return server, job.remote_id

@@ -70,7 +70,6 @@ def _until(predicate: Any, seconds: float) -> None:
 
 @pytest.fixture(autouse=True)
 def _fast_pool(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("COMPUTE_POOL_TICK_S", "0.1")
     monkeypatch.setenv("COMPUTE_POOL_DOWN_AFTER_S", "0.5")
 
 
@@ -102,41 +101,38 @@ def test_a_job_whose_code_raises_is_a_result_and_is_not_resubmitted(two: Any) ->
     with ComputeServerClient([a.url, b.url], TOKEN) as client:
         outcome = client.wait(client.submit("def run():\n    raise ValueError('typo')\n"))
         assert "typo" in str(outcome["error"])
-        assert client.jobs()["jobs"][0]["requeued"] == 0
+        assert client.jobs()["jobs"][0]["moved"] == 0
     assert len(a.remote_ids_oldest_first()) + len(b.remote_ids_oldest_first()) == 1
 
 
-def test_a_job_on_a_server_that_goes_down_runs_next_on_another(two: Any) -> None:
+def test_a_job_on_a_server_that_goes_down_is_resubmitted_to_another(two: Any) -> None:
     a, b = two
     with ComputeServerClient([a.url, b.url], TOKEN) as client:
         first = client.submit(SLEEP, variables={"t": 3, "tag": "first"})
-        second = client.submit(SLEEP, variables={"t": 1.5, "tag": "second"})
-        _until(lambda: client.status(first) == "running" and client.status(second) == "running", 10)
-        third = client.submit(SLEEP, variables={"t": 0, "tag": "third"})
+        second = client.submit(SLEEP, variables={"t": 1, "tag": "second"})
+        _until(lambda: client.status(first) == "running", 10)
 
         lost = client._jobs[first]
         doomed, survivor = (a, b) if lost.server == a.url else (b, a)
         doomed.stop()
 
-        moved = client.wait(first, timeout_s=30)
+        moved = client.wait(first, timeout_s=30, poll_s=0.1)
         assert moved["values"] == {"tag": "first"}
         assert moved["provenance"]["server_url"] == survivor.url
-        client.wait(third, timeout_s=30)
-
-        # The requeued job went ahead of the one that was waiting in the pool.
-        order = survivor.remote_ids_oldest_first()
-        assert order.index(client._jobs[first].remote_id) < order.index(client._jobs[third].remote_id)
+        assert lost.history and lost.history[0][0] == doomed.url
+        assert client.wait(second, timeout_s=30)["values"] == {"tag": "second"}
 
 
 def test_a_server_that_comes_back_takes_jobs_again(two: Any) -> None:
     a, b = two
     with ComputeServerClient([a.url, b.url], TOKEN) as client:
         a.stop()
-        _until(lambda: not client.jobs()["servers"][a.url]["up"], 10)
+        early = client.submit(SLEEP, variables={"t": 2, "tag": "early"})
+        assert client._jobs[early].server == b.url
         a.start()
-        _until(lambda: client.jobs()["servers"][a.url]["up"], 10)
-        handles = [client.submit(SLEEP, variables={"t": 1, "tag": i}) for i in range(2)]
-        assert {client.wait(h)["provenance"]["server_url"] for h in handles} == {a.url, b.url}
+        late = client.submit(SLEEP, variables={"t": 0, "tag": "late"})
+        assert client.wait(late, timeout_s=10)["provenance"]["server_url"] == a.url
+        client.wait(early, timeout_s=10)
 
 
 def test_a_server_added_to_the_pools_file_joins_a_running_client(two: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,21 +141,19 @@ def test_a_server_added_to_the_pools_file_joins_a_running_client(two: Any, tmp_p
     pools.write_text(json.dumps({"stub": [a.url]}))
     monkeypatch.setenv("COMPUTE_SERVER_POOLS", str(pools))
     with ComputeServerClient("pool://stub", TOKEN) as client:
-        busy = client.submit(SLEEP, variables={"t": 2, "tag": "busy"})
-        _until(lambda: client.status(busy) == "running", 10)
+        client.submit(SLEEP, variables={"t": 2, "tag": "busy"})
         pools.write_text(json.dumps({"stub": [a.url, {"url": b.url}]}))
         os.utime(pools, (time.time() + 5, time.time() + 5))
         joined = client.wait(client.submit(SLEEP, variables={"t": 0, "tag": "new"}), timeout_s=10)
     assert joined["provenance"]["server_url"] == b.url
 
 
-def test_a_refusal_reaches_the_caller_through_wait(tmp_path: Path) -> None:
+def test_a_refusal_from_every_server_reaches_the_caller_at_submit(tmp_path: Path) -> None:
     released = Stub(tmp_path / "r", release="v2.0.0").start()
     try:
         with ComputeServerClient([released.url], TOKEN, agent_release="v1.0.0") as client:
-            handle = client.submit("def run():\n    return {}\n")
             with pytest.raises(Refused) as caught:
-                client.wait(handle, timeout_s=10)
+                client.submit("def run():\n    return {}\n")
         assert caught.value.reason == "agent_release_stale"
     finally:
         released.stop()
@@ -199,4 +193,4 @@ def test_a_refusal_from_one_server_sends_the_job_to_another(two: Any, monkeypatc
         assert accepted["provenance"]["server_url"] == b.url
 
     with ComputeServerClient([a.url], TOKEN) as client, pytest.raises(Refused):
-        client.wait(client.submit("def run():\n    return {}\n"), timeout_s=10)
+        client.submit("def run():\n    return {}\n")

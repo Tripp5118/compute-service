@@ -76,16 +76,18 @@ the definition at the tag the server names and resubmit.
 
 Pass a list of URLs, or `pool://<tool>` with `COMPUTE_SERVER_POOLS` naming a
 JSON file like `{"<tool>": ["http://a:8000", {"url": "https://b/x", "token_env": "B_TOKEN"}]}`.
-The same methods work. `submit` returns a handle at once; the pool hands each
-job to a server that has nothing queued or running, so the order you submit in
-is the order jobs start.
+The same methods work. `submit` sends the job at once to the server with the
+fewest jobs queued or running; the servers hold the queues, and the client only
+watches.
 
-A server that stops answering for `COMPUTE_POOL_DOWN_AFTER_S` (60) seconds has
-its unfinished jobs moved to the front of the queue; a job a restarted server no
-longer knows is moved the same way. It takes jobs again when it answers. The file
-is re-read when it changes, so a server added to it joins running clients. A job
-whose own code raised, or that hit its own `timeout_s`, is a result and is not
-rerun. `result()["provenance"]["server_url"]` says where a job ran.
+When the client polls a job (every `wait` poll does) and its server has not
+answered for `COMPUTE_POOL_DOWN_AFTER_S` (60) seconds, or no longer knows the
+job because it restarted, the job is resubmitted to another server. A server is
+tried again each time a job is placed, and the file is re-read when it changes,
+so a server added to it takes new jobs from running clients. A job whose own code
+raised, or that hit its own `timeout_s`, is a result and is not rerun. A refusal
+from one server sends the job to the next; `Refused` is raised only when every
+server refuses. `result()["provenance"]["server_url"]` says where a job ran.
 
 ## What it does not do
 
