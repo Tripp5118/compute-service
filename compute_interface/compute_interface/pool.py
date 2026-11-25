@@ -5,7 +5,8 @@ returns a `PooledClient`. A caller's code does not change: `submit` returns a ha
 `status`, `wait`, `result`, `run`, `files`, `fetch`, `stream`, `cancel` and `discard` take it.
 
 **The servers hold the queues; the pool only places and watches.** `submit` sends the job at
-once to the member with the fewest jobs queued or running. After that the pool looks at the job
+once to the member with the fewest jobs queued or running per unit of `capacity` it reports
+(1 unless the server says otherwise). After that the pool looks at the job
 only when the caller does: every `status`, and so every poll of `wait`, checks that job and, at
 most every 30 s, every server holding another of this client's unfinished jobs.
 
@@ -197,7 +198,11 @@ class PooledClient(ComputeServerClient):
             except (httpx.HTTPError, ValueError):
                 continue
             if payload.get("worker_alive", True):
-                load = int(payload.get("queued", 0)) + int(payload.get("running", 0))
+                # `capacity` is how many jobs a member runs at once: 1 for a container with one
+                # worker, HPRC_MAX_INFLIGHT for a server that hands jobs to a cluster. Without
+                # it, a member able to run thirty jobs would get the same share as one.
+                capacity = max(1, int(payload.get("capacity", 1)))
+                load = (int(payload.get("queued", 0)) + int(payload.get("running", 0))) / capacity
                 loads.append((url == avoid, load, url))
         refusal: Refused | None = None
         for _, _, url in sorted(loads):

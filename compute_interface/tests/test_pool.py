@@ -97,6 +97,18 @@ def test_jobs_spread_over_idle_servers(two: Any) -> None:
     assert servers == {a.url, b.url}
 
 
+def test_a_member_with_more_capacity_takes_more_jobs(two: Any) -> None:
+    a, b = sorted(two, key=lambda stub: stub.url)
+    # A plain JobManager has no `max_inflight`; giving it one makes /jobs report `capacity`.
+    a.server.config.app.state.jobs.max_inflight = 1
+    b.server.config.app.state.jobs.max_inflight = 3
+    with ComputeServerClient([a.url, b.url], TOKEN) as client:
+        handles = [client.submit(SLEEP, variables={"t": 2, "tag": i}) for i in range(4)]
+        placed = [client.wait(h)["provenance"]["server_url"] for h in handles]
+    assert placed.count(a.url) == 1
+    assert placed.count(b.url) == 3
+
+
 def test_a_job_whose_code_raises_is_a_result_and_is_not_resubmitted(two: Any) -> None:
     a, b = two
     with ComputeServerClient([a.url, b.url], TOKEN) as client:

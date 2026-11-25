@@ -176,6 +176,8 @@ def create_app(
         if hasattr(manager, "degraded") and hasattr(manager, "inflight"):
             payload["degraded"] = manager.degraded
             payload["inflight"] = manager.inflight
+        if hasattr(manager, "max_inflight"):
+            payload["capacity"] = manager.max_inflight
         return payload
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
