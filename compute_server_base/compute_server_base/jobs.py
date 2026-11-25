@@ -127,6 +127,8 @@ class Job:
             for, and killing the group is what reaches a solver the job spawned.
         slurm_id: SLURM job id, set by SlurmJobManager once the job is handed
             to SLURM. None for jobs run in this process.
+        fallback: SlurmJobManager has sent, or must send, this job to a fallback
+            compute server; `fallback_url` and `fallback_id` say where, once sent.
     """
 
     id: str
@@ -138,6 +140,9 @@ class Job:
     workdir: Path | None = None
     pgid: int | None = None
     slurm_id: str | None = None
+    fallback: bool = False
+    fallback_url: str | None = None
+    fallback_id: str | None = None
     status: JobStatus = JobStatus.QUEUED
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None

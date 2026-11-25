@@ -131,6 +131,9 @@ class SlurmJobManager:
         max_inflight: int | None = None,
         poll_s: float | None = None,
         keep_remote: bool | None = None,
+        fallback_urls: list[str] | None = None,
+        fallback_after_s: float | None = None,
+        fallback_pending_s: float | None = None,
     ) -> None:
         """Read the HPRC_* settings once. Keyword arguments override the environment.
 
@@ -150,8 +153,25 @@ class SlurmJobManager:
         self.poll_s = float(_setting(poll_s, "HPRC_POLL_S", "60"))
         keep = _setting(None if keep_remote is None else int(keep_remote), "HPRC_KEEP_REMOTE", "0")
         self.keep_remote = keep == "1"
+        # Plain compute servers that take a job when the cluster cannot: unreachable for
+        # FALLBACK_AFTER_S, a SLURM job that ends without a result, or one pending in the
+        # queue for FALLBACK_PENDING_S. Empty means no fallback.
+        urls = fallback_urls if fallback_urls is not None else _setting(None, "HPRC_FALLBACK_URLS", "").split(",")
+        self.fallback_urls = [url.strip().rstrip("/") for url in urls if url.strip()]
+        self.fallback_token = os.environ.get("HPRC_FALLBACK_TOKEN") or os.environ.get("COMPUTE_SERVER_TOKEN", "")
+        self.fallback_after_s = float(_setting(fallback_after_s, "HPRC_FALLBACK_AFTER_S", "600"))
+        self.fallback_pending_s = float(_setting(fallback_pending_s, "HPRC_FALLBACK_PENDING_S", "3600"))
 
         self.degraded: str | None = None
+        self._degraded_since: float | None = None
+        # When each SLURM job was first seen PENDING; in memory, so a restart restarts the clock.
+        self._pending_since: dict[str, float] = {}
+        # SLURM jobs superseded by a fallback result, to scancel and clean up once reachable.
+        # ponytail: in memory only; a restart forgets them and they run out their --time.
+        self._orphans: dict[str, str] = {}
+        # Whether this pass made an ssh or rsync call that succeeded. A pass with nothing to send
+        # makes no call, and must not clear `degraded` as though the cluster had answered.
+        self._reached = False
         self._root = workspace_root()
         self._state_file = self._root / "jobs.json"
         self._jobs: dict[str, Job] = {}
@@ -237,9 +257,14 @@ class SlurmJobManager:
             return True
         if job.status == JobStatus.RUNNING:
             job.cancel_requested = True
-            rc, _, err = await self._run(self._ssh_argv(["scancel", job.slurm_id]))
-            if rc != 0:
-                job.publish_log("error", f"scancel {job.slurm_id} failed: {_last_line(err) or f'exit {rc}'}")
+            if job.slurm_id:
+                rc, _, err = await self._run(self._ssh_argv(["scancel", job.slurm_id]))
+                if rc != 0:
+                    job.publish_log("error", f"scancel {job.slurm_id} failed: {_last_line(err) or f'exit {rc}'}")
+            if job.fallback_id:
+                await asyncio.to_thread(self._fallback_cancel, job.fallback_url, job.fallback_id)
+                if not job.slurm_id:
+                    self._settle(job, JobStatus.CANCELLED, {"type": "error", "message": "cancelled"})
             self._save()
             return True
         return False
@@ -293,18 +318,26 @@ class SlurmJobManager:
         The first failed ssh or rsync call ends the pass and sets `degraded`. The
         next pass tries again. A pass that reaches the cluster clears `degraded`.
         """
+        self._reached = False
         try:
             # Collect first, so a slot a finished job frees is refilled in the same pass.
             await self._collect()
             await self._submit_queued()
+            await self._clean_orphans()
         except _Unreachable as exc:
             self.degraded = str(exc)
+            if self._degraded_since is None:
+                self._degraded_since = time.monotonic()
         else:
-            self.degraded = None
+            if self._reached:
+                self.degraded = None
+                self._degraded_since = None
+        if self.fallback_urls:
+            await self._fallback_pass()
 
     async def _submit_queued(self) -> None:
         queued = sorted(
-            (job for job in self._jobs.values() if job.status == JobStatus.QUEUED),
+            (job for job in self._jobs.values() if job.status == JobStatus.QUEUED and not job.fallback),
             key=lambda job: job.created_at,
         )
         for job in queued:
@@ -323,7 +356,7 @@ class SlurmJobManager:
             self._save()
 
     async def _collect(self) -> None:
-        running = [job for job in self._jobs.values() if job.status == JobStatus.RUNNING]
+        running = [job for job in self._jobs.values() if job.status == JobStatus.RUNNING and job.slurm_id]
         if not running:
             return
         ids = ",".join(job.slurm_id for job in running)
@@ -335,9 +368,23 @@ class SlurmJobManager:
                 self._missing[job.id] = self._missing.get(job.id, 0) + 1
                 if self._missing[job.id] > _MAX_MISSING_POLLS:
                     message = f"slurm lost job {job.id}"
-                    self._settle(job, JobStatus.FAILED, {"type": "error", "message": message}, error=message)
+                    if not self._hand_to_fallback(job, message):
+                        self._settle(job, JobStatus.FAILED, {"type": "error", "message": message}, error=message)
                 continue
             self._missing.pop(job.id, None)
+            if state == "PENDING":
+                since = self._pending_since.setdefault(job.id, time.monotonic())
+                if (
+                    self.fallback_urls
+                    and not job.fallback
+                    and time.monotonic() - since >= self.fallback_pending_s
+                ):
+                    slurm_id = job.slurm_id
+                    await self._ssh(["scancel", slurm_id])
+                    await self._ssh(["rm", "-rf", self._remote_dir(job.id)])
+                    self._hand_to_fallback(job, f"slurm job {slurm_id} pending for {self.fallback_pending_s:.0f} s")
+                continue
+            self._pending_since.pop(job.id, None)
             if state in _TERMINAL_SLURM_STATES:
                 await self._finish(job, state)
 
@@ -366,11 +413,160 @@ class SlurmJobManager:
         elif state == "CANCELLED":
             self._settle(job, JobStatus.CANCELLED, {"type": "error", "message": "cancelled"})
         else:
+            # The cluster lost the job (node failure, out of memory, killed, cancelled by an
+            # admin): nothing the job's code did, so it gets another machine, not a failure.
             message = f"slurm job {job.slurm_id} ended {state} without reporting a result"
-            self._settle(job, JobStatus.FAILED, {"type": "error", "message": message}, error=message)
+            if not self._hand_to_fallback(job, message):
+                self._settle(job, JobStatus.FAILED, {"type": "error", "message": message}, error=message)
 
         if not self.keep_remote:
             await self._ssh(["rm", "-rf", remote])
+
+    def _hand_to_fallback(self, job: Job, why: str) -> bool:
+        """Stop tracking the job on SLURM and mark it for a fallback server. False if there is none."""
+        if not self.fallback_urls:
+            return False
+        job.slurm_id = None
+        job.fallback = True
+        self._pending_since.pop(job.id, None)
+        self._missing.pop(job.id, None)
+        job.publish_log("error", f"{why}; sending it to a fallback server")
+        self._save()
+        return True
+
+    async def _fallback_pass(self) -> None:
+        """Send jobs the cluster cannot run to a fallback server, and collect the ones there.
+
+        While the cluster has been unreachable for FALLBACK_AFTER_S, queued jobs go to a fallback
+        server and running ones also start a copy there; whichever copy finishes first is the
+        result. Errors talking to a fallback server are logged on the job and retried next pass.
+        """
+        unreachable = (
+            self._degraded_since is not None and time.monotonic() - self._degraded_since >= self.fallback_after_s
+        )
+        for job in list(self._jobs.values()):
+            if job.status not in (JobStatus.QUEUED, JobStatus.RUNNING) or job.cancel_requested:
+                continue
+            if job.fallback_id is None and (job.fallback or unreachable):
+                why = "cluster could not run it" if job.fallback else "cluster unreachable"
+                await self._fallback_send(job, why)
+            elif job.fallback_id is not None:
+                await self._fallback_check(job)
+
+    async def _fallback_send(self, job: Job, why: str) -> None:
+        try:
+            url, remote = await asyncio.to_thread(self._fallback_submit, job)
+        except Exception as exc:  # noqa: BLE001 — retried next pass
+            job.publish_log("error", f"fallback submit failed: {exc}")
+            return
+        job.fallback, job.fallback_url, job.fallback_id = True, url, remote
+        if job.status == JobStatus.QUEUED:
+            job.status = JobStatus.RUNNING
+            job.started_at = time.monotonic()
+        job.publish_log("info", f"{why}; running on {url} as job {remote}")
+        self._save()
+
+    async def _fallback_check(self, job: Job) -> None:
+        try:
+            outcome = await asyncio.to_thread(self._fallback_collect, job)
+        except Exception as exc:  # noqa: BLE001 — retried next pass
+            job.publish_log("error", f"fallback poll of {job.fallback_url} failed: {exc}")
+            return
+        if outcome is None:
+            return
+        if outcome == "lost":
+            job.publish_log("error", f"{job.fallback_url} no longer knows job {job.fallback_id}; sending it again")
+            job.fallback, job.fallback_url, job.fallback_id = True, None, None
+            self._save()
+            return
+        status = outcome.get("status")
+        if status == "cancelled" and not job.cancel_requested:
+            job.publish_log("error", f"{job.fallback_url} cancelled job {job.fallback_id}; sending it again")
+            job.fallback, job.fallback_url, job.fallback_id = True, None, None
+            self._save()
+            return
+        if job.slurm_id:
+            # The fallback copy won the race: the SLURM copy is superseded.
+            self._orphans[job.slurm_id] = self._remote_dir(job.id)
+            job.slurm_id = None
+        if status == "succeeded":
+            values = outcome.get("values") or {}
+            self._settle(job, JobStatus.SUCCEEDED, {"type": "result", "values": values}, values=values)
+        elif status == "cancelled":
+            self._settle(job, JobStatus.CANCELLED, {"type": "error", "message": "cancelled"})
+        else:
+            error = str(outcome.get("error") or "job failed on the fallback server")
+            event: dict[str, Any] = {"type": "error", "message": error}
+            if outcome.get("traceback"):
+                event["traceback"] = outcome["traceback"]
+            self._settle(job, JobStatus.FAILED, event, error=error, job_traceback=outcome.get("traceback"))
+
+    def _fallback_client(self, url: str) -> Any:
+        from compute_interface import ComputeServerClient
+
+        return ComputeServerClient(url, self.fallback_token, timeout=60.0)
+
+    def _fallback_submit(self, job: Job) -> tuple[str, str]:
+        """Submit to the fallback server with the fewest queued and running jobs."""
+        loads = []
+        for url in self.fallback_urls:
+            try:
+                with self._fallback_client(url) as client:
+                    payload = client.jobs()
+            except Exception:  # noqa: BLE001, S112 — an unreachable fallback is skipped
+                continue
+            if payload.get("worker_alive", True):
+                loads.append((int(payload.get("queued", 0)) + int(payload.get("running", 0)), url))
+        for _, url in sorted(loads):
+            try:
+                with self._fallback_client(url) as client:
+                    remote = client.submit(
+                        job.code,
+                        entrypoint=job.entrypoint,
+                        variables=job.variables,
+                        correlation_id=job.correlation_id,
+                        timeout_s=job.timeout_s,
+                    )
+            except Exception:  # noqa: BLE001, S112 — try the next one
+                continue
+            return url, remote
+        raise RuntimeError(f"no fallback server took the job (tried {', '.join(self.fallback_urls)})")
+
+    def _fallback_collect(self, job: Job) -> dict[str, Any] | str | None:
+        """None while running; "lost" if the server forgot it; else the result, with files copied here."""
+        import httpx
+
+        with self._fallback_client(job.fallback_url) as client:
+            try:
+                status = client.status(job.fallback_id)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    return "lost"
+                raise
+            if status not in ("succeeded", "failed", "cancelled"):
+                return None
+            result = client.result(job.fallback_id)
+            for entry in result.get("files", []):
+                dest = job.workdir / entry["path"]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                client.fetch(job.fallback_id, entry["path"], dest)
+            client.discard(job.fallback_id)
+            return result
+
+    def _fallback_cancel(self, url: str | None, remote: str | None) -> None:
+        if not url or not remote:
+            return
+        try:
+            with self._fallback_client(url) as client:
+                client.cancel(remote)
+        except Exception:  # noqa: BLE001 — best effort; the job's own result is already settled
+            traceback.print_exc()
+
+    async def _clean_orphans(self) -> None:
+        for slurm_id, remote in list(self._orphans.items()):
+            await self._ssh(["scancel", slurm_id])
+            await self._ssh(["rm", "-rf", remote])
+            del self._orphans[slurm_id]
 
     def _settle(
         self,
@@ -389,6 +585,14 @@ class SlurmJobManager:
         job.finished_at = time.monotonic()
         job.publish_terminal(event)
         self._missing.pop(job.id, None)
+        self._pending_since.pop(job.id, None)
+        if job.fallback_id and job.slurm_id is not None:
+            # SLURM won the race: the fallback copy is no longer wanted.
+            task = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(self._fallback_cancel, job.fallback_url, job.fallback_id)
+            )
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
         self._save()
 
     def _remote_dir(self, job_id: str) -> str:
@@ -414,6 +618,7 @@ class SlurmJobManager:
         rc, out, err = await self._run(self._ssh_argv(remote_command))
         if rc != 0:
             raise _Unreachable(_last_line(err) or f"ssh exited {rc}")
+        self._reached = True
         return out
 
     async def _rsync(self, source: str, dest: str) -> None:
@@ -422,6 +627,7 @@ class SlurmJobManager:
         )
         if rc != 0:
             raise _Unreachable(_last_line(err) or f"rsync exited {rc}")
+        self._reached = True
 
     async def _run(self, args: list[str]) -> tuple[int, str, str]:
         """Run one command with no shell. The only place ssh and rsync are launched."""
