@@ -26,14 +26,26 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    Depends,
+    FastAPI,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from starlette.background import BackgroundTask
 
 from compute_server_base.auth import check_ws_token, require_token, set_audience
 from compute_server_base.jobs import TERMINAL_STATUSES, JobManager, JobStatus
-from compute_server_base.refusal import RefusalReason, Refused, refuse, stale_agent_detail
+from compute_server_base.refusal import (
+    RefusalReason,
+    Refused,
+    refuse,
+    stale_agent_detail,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -68,6 +80,7 @@ def create_app(
     *,
     tool_name: str,
     on_startup: Callable[[], None] | None = None,
+    manager: JobManager | None = None,
 ) -> FastAPI:
     """Build an instance's FastAPI app with the shared routes mounted.
 
@@ -76,16 +89,19 @@ def create_app(
         on_startup: Instance-specific startup probing, run after the job worker
             starts. Raising here aborts startup; log instead if the server
             should come up degraded.
+        manager: The job manager to serve. Defaults to an in-process JobManager;
+            pass a SlurmJobManager to run jobs on a cluster.
 
     Returns:
-        The app, with `app.state.jobs` holding the JobManager.
+        The app, with `app.state.jobs` holding the job manager.
     """
     # Before any route exists: a dashboard-issued token carries `aud: tool:<name>`,
     # so this server has to know its own name to reject one minted for a sibling
     # instance (S-4).
     set_audience(tool_name)
 
-    manager = JobManager()
+    if manager is None:
+        manager = JobManager()
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -136,7 +152,7 @@ def create_app(
         """
         jobs = manager.all_jobs()
         now = time.monotonic()
-        return {
+        payload: dict[str, Any] = {
             "worker_alive": manager.worker_alive(),
             "queued": sum(1 for job in jobs if job.status == JobStatus.QUEUED),
             "running": sum(1 for job in jobs if job.status == JobStatus.RUNNING),
@@ -156,6 +172,11 @@ def create_app(
                 for job in jobs
             ],
         }
+        # Only a SlurmJobManager has an ssh failure message and an in-flight count.
+        if hasattr(manager, "degraded") and hasattr(manager, "inflight"):
+            payload["degraded"] = manager.degraded
+            payload["inflight"] = manager.inflight
+        return payload
 
     @app.get("/jobs/{job_id}", dependencies=[Depends(require_token)])
     async def job_status(job_id: str) -> dict[str, Any]:

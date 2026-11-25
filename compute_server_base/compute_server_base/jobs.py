@@ -125,6 +125,8 @@ class Job:
             `cancel()` needs it to kill something. The group id rather than the
             process handle because the group outlives the child it was named
             for, and killing the group is what reaches a solver the job spawned.
+        slurm_id: SLURM job id, set by SlurmJobManager once the job is handed
+            to SLURM. None for jobs run in this process.
     """
 
     id: str
@@ -135,6 +137,7 @@ class Job:
     timeout_s: float | None
     workdir: Path | None = None
     pgid: int | None = None
+    slurm_id: str | None = None
     status: JobStatus = JobStatus.QUEUED
     created_at: float = field(default_factory=time.monotonic)
     started_at: float | None = None
